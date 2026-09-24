@@ -23,33 +23,27 @@ This service (`backend/`) is the TokenGuard AI API proxy. Over time it will:
 - asynchronously persist usage logs
 - expose usage data to a Next.js dashboard
 
-**None of the above is implemented yet.**
+## Current scope: Step 4 — AI proxy + provider integration
 
-## Current scope: Step 2 — Authentication + multi-tenant foundation
+Step 1 established the Fastify/TypeScript foundation. Step 2 added
+Supabase auth, organizations, and TokenGuard API keys. Step 3 added the
+`token_logs` persistence layer (not yet written to by anything). Step 4
+makes TokenGuard forward real, non-streaming requests to OpenAI and
+Anthropic:
 
-Step 1 established the Fastify/TypeScript foundation (`GET /health`,
-centralized config/error handling/logging, tooling). Step 2 adds:
+- `POST /v1/chat/completions` (OpenAI-compatible) and `POST /v1/messages`
+  (Anthropic) — see **AI proxy** below
+- provider adapters (`src/modules/providers/`) behind a common
+  `ProviderAdapter` interface, so adding a provider later means writing a
+  new adapter, not touching the routes
+- a request-timeout and body-size-limit policy, both configurable
+- a TokenGuard request ID on every request/response, usable later to
+  correlate a proxy call with its usage log
 
-- Supabase as the Postgres database and user-auth provider, via
-  `supabase/migrations/` and `@supabase/supabase-js`
-- `organizations`, `organization_members`, and `token_guard_keys` tables
-  with Row Level Security (see **Database** below)
-- a reusable Supabase-access-token verification hook
-  (`src/modules/auth/`) that authenticates dashboard/API users
-- TokenGuard API key generation, hashing, verification, and revocation
-  (`src/modules/keys/`) — keys are stored only as a SHA-256 hash, never
-  in plaintext
-- organization membership and role-based authorization
-  (`src/modules/organizations/`)
-- endpoints to exercise the above: `GET /v1/me`, `POST /v1/organizations`,
-  `GET /v1/organizations`, `POST /v1/organizations/:id/keys`,
-  `POST /v1/organizations/:id/keys/:keyId/revoke`
-
-There is still **no AI provider proxy** (`/v1/chat/completions` and
-similar are not implemented), no token/cost accounting, no budget
-enforcement, and no dashboard. `keysService.verifyKey()` is the reusable
-credential-resolution function a later proxy step will call — it is not
-wired to any route yet.
+Streaming (`stream: true`) is explicitly rejected with `501` — it lands in
+Step 6. This step does not count tokens, calculate cost, enforce budgets,
+persist usage logs, or add a dashboard; `usageService.createUsageLog()`
+(Step 3) is not called from the proxy yet.
 
 ## Database
 
@@ -86,9 +80,69 @@ depth for any future client that connects to Supabase directly.
 
 - **Supabase access tokens** (`Authorization: Bearer <token>`) authenticate
   a human dashboard/API user. Verified via `authClient.auth.getUser()`.
-- **TokenGuard API keys** (`tg_usr_live_...`) will authenticate a
-  customer's proxy traffic in a later step. They are generated, hashed,
-  and verified independently of Supabase Auth.
+- **TokenGuard API keys** (`tg_usr_live_...`, header `X-TokenGuard-Key`)
+  authenticate a customer's proxy traffic. They identify which
+  organization a proxy request belongs to — they never authenticate
+  against OpenAI or Anthropic.
+
+The AI proxy adds a **third**, distinct credential: the customer's own
+**provider API key** (their OpenAI or Anthropic key), sent on the same
+request as the `X-TokenGuard-Key`. TokenGuard uses it only in memory, for
+the single upstream call, and:
+
+- never persists it (not in Supabase, not in `token_logs`, nowhere)
+- never logs it (not in request logs, not in error messages, not in stack
+  traces)
+- never returns it in any response
+
+## AI proxy
+
+Both endpoints require **two** headers: `X-TokenGuard-Key` (identifies the
+organization within TokenGuard) and the provider's own credential header
+(authenticates against that provider). A missing/invalid/revoked
+`X-TokenGuard-Key` always returns the same generic `401` — the response
+never reveals whether a key existed, was revoked, or was simply wrong.
+
+### `POST /v1/chat/completions` (OpenAI-compatible)
+
+```
+X-TokenGuard-Key: tg_usr_live_...
+Authorization: Bearer <your-openai-api-key>
+Content-Type: application/json
+
+{ "model": "gpt-4o", "messages": [{ "role": "user", "content": "Hello" }] }
+```
+
+The body is forwarded to `OPENAI_BASE_URL/v1/chat/completions` byte for
+byte — TokenGuard does not parse and reconstruct it. The upstream status
+code, body, and content-type are returned unmodified.
+
+### `POST /v1/messages` (Anthropic)
+
+```
+X-TokenGuard-Key: tg_usr_live_...
+x-api-key: <your-anthropic-api-key>
+anthropic-version: 2023-06-01
+Content-Type: application/json
+
+{ "model": "claude-sonnet-5", "max_tokens": 100, "messages": [{ "role": "user", "content": "Hello" }] }
+```
+
+`anthropic-version` is forwarded when you send it; TokenGuard never
+invents or defaults one on your behalf. The body is forwarded to
+`ANTHROPIC_BASE_URL/v1/messages` byte for byte.
+
+### Not yet supported
+
+- **Streaming** (`"stream": true`) is rejected with `501` and
+  `{"error":{"code":"STREAMING_NOT_IMPLEMENTED", ...}}`, without
+  contacting the provider. Lands in Step 6.
+- Every response carries `X-TokenGuard-Request-Id`. It is not yet linked
+  to a persisted usage log (Step 3's `token_logs` table exists, but the
+  proxy doesn't write to it yet).
+- A request to the provider that times out (`PROVIDER_REQUEST_TIMEOUT_MS`)
+  returns `504` / `UPSTREAM_TIMEOUT`; an unreachable provider returns
+  `502` / `UPSTREAM_UNAVAILABLE`. Neither ever includes a credential.
 
 ## Local setup
 
@@ -105,13 +159,16 @@ The server starts on `http://localhost:3000` by default.
 
 Configuration is centralized in `src/config/env.ts` and loaded from `.env`
 via `dotenv`. See `.env.example` for the currently supported variables:
-`PORT`, `HOST`, `NODE_ENV`, and the Supabase settings (`SUPABASE_URL`,
-`SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`). Without real Supabase
-values, the server falls back to local-development placeholders that
-cannot authenticate against a real project; in production, all three
-Supabase variables are required. `SUPABASE_SERVICE_ROLE_KEY` bypasses Row
-Level Security and must never reach a browser or be logged — see
-**Database** above.
+`PORT`, `HOST`, `NODE_ENV`; the Supabase settings (`SUPABASE_URL`,
+`SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`); and the proxy settings
+(`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `PROVIDER_REQUEST_TIMEOUT_MS`,
+`MAX_PROXY_BODY_BYTES`). Without real Supabase values, the server falls
+back to local-development placeholders that cannot authenticate against a
+real project; in production, all three Supabase variables are required.
+`SUPABASE_SERVICE_ROLE_KEY` bypasses Row Level Security and must never
+reach a browser or be logged — see **Database** above. There is
+deliberately no `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` variable: provider
+credentials always come from the request, never from server config.
 
 ## Available commands
 
@@ -169,9 +226,13 @@ Body: `{ "name": "..." }`. Returns the new TokenGuard key's plaintext value
 Requires Supabase authentication and an `owner` role in that organization.
 Revokes the key; a revoked key fails verification from then on.
 
+### `POST /v1/chat/completions` and `POST /v1/messages`
+
+The AI proxy — see **AI proxy** above.
+
 ## Not implemented yet
 
-The AI provider proxy (`/v1/chat/completions` and similar), token/cost
-accounting, agent-loop detection, budget enforcement, usage logging, and
-the dashboard are **not implemented**. They will be addressed in later
-steps.
+Token/cost accounting, agent-loop detection, budget enforcement, usage
+logging (the proxy doesn't call `usageService.createUsageLog()` yet),
+streaming, and the dashboard are **not implemented**. They will be
+addressed in later steps.

@@ -4,7 +4,10 @@ import type { NodeEnv } from "../config/env.js";
 // Headers and fields that must never appear in logs. This matters because
 // future requests will carry TokenGuard API keys, provider credentials, and
 // customer prompts that must not be persisted to logs.
-const REDACTED_PATHS = [
+// Exported so tests can build a logger with the same redaction config when
+// they need logging enabled (e.g. to assert that no secret ever appears in
+// a log line) — production behavior stays defined in exactly one place.
+export const REDACTED_PATHS = [
   "req.headers.authorization",
   "req.headers.cookie",
   "req.headers['x-api-key']",

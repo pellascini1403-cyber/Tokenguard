@@ -18,3 +18,14 @@ export interface VerifiedKeyContext {
   organizationId: string;
   name: string;
 }
+
+declare module "fastify" {
+  interface FastifyRequest {
+    /**
+     * Set once the X-TokenGuard-Key header has been verified. Distinct
+     * from `authUser` (a Supabase dashboard user): this identifies the
+     * organization/credential behind proxy traffic, not a human.
+     */
+    tokenGuardContext?: VerifiedKeyContext;
+  }
+}

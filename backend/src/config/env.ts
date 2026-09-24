@@ -14,12 +14,24 @@ export interface SupabaseEnvConfig {
   serviceRoleKey: string;
 }
 
+export interface ProxyEnvConfig {
+  /** Upstream base URL for OpenAI-compatible requests. Not secret. */
+  openaiBaseUrl: string;
+  /** Upstream base URL for Anthropic requests. Not secret. */
+  anthropicBaseUrl: string;
+  /** How long the proxy waits for an upstream provider response before aborting. */
+  requestTimeoutMs: number;
+  /** Maximum accepted request body size for proxy endpoints, in bytes. */
+  maxBodyBytes: number;
+}
+
 export interface EnvConfig {
   nodeEnv: NodeEnv;
   port: number;
   host: string;
   isProduction: boolean;
   supabase: SupabaseEnvConfig;
+  proxy: ProxyEnvConfig;
 }
 
 function parseNodeEnv(value: string | undefined): NodeEnv {
@@ -69,6 +81,55 @@ function parseSupabaseConfig(source: NodeJS.ProcessEnv, nodeEnv: NodeEnv): Supab
   };
 }
 
+const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com";
+const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+// Generous enough for large multi-turn contexts as raw JSON, still bounded
+// against arbitrarily large request bodies.
+const DEFAULT_MAX_PROXY_BODY_BYTES = 5 * 1024 * 1024;
+const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 30_000;
+
+function parseBaseUrl(value: string | undefined, defaultValue: string, label: string): string {
+  const url = value && value.length > 0 ? value : defaultValue;
+  try {
+    new URL(url);
+  } catch {
+    throw new Error(`Invalid ${label} value: "${url}". Expected an absolute URL.`);
+  }
+  return url;
+}
+
+function parsePositiveInt(value: string | undefined, defaultValue: number, label: string): number {
+  if (value === undefined || value === "") {
+    return defaultValue;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid ${label} value: "${value}". Expected a positive integer.`);
+  }
+  return parsed;
+}
+
+function parseProxyConfig(source: NodeJS.ProcessEnv): ProxyEnvConfig {
+  return {
+    openaiBaseUrl: parseBaseUrl(source.OPENAI_BASE_URL, DEFAULT_OPENAI_BASE_URL, "OPENAI_BASE_URL"),
+    anthropicBaseUrl: parseBaseUrl(
+      source.ANTHROPIC_BASE_URL,
+      DEFAULT_ANTHROPIC_BASE_URL,
+      "ANTHROPIC_BASE_URL",
+    ),
+    requestTimeoutMs: parsePositiveInt(
+      source.PROVIDER_REQUEST_TIMEOUT_MS,
+      DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS,
+      "PROVIDER_REQUEST_TIMEOUT_MS",
+    ),
+    maxBodyBytes: parsePositiveInt(
+      source.MAX_PROXY_BODY_BYTES,
+      DEFAULT_MAX_PROXY_BODY_BYTES,
+      "MAX_PROXY_BODY_BYTES",
+    ),
+  };
+}
+
 export function loadEnv(source: NodeJS.ProcessEnv = process.env): EnvConfig {
   const nodeEnv = parseNodeEnv(source.NODE_ENV);
   return {
@@ -77,5 +138,6 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): EnvConfig {
     host: source.HOST && source.HOST.length > 0 ? source.HOST : "0.0.0.0",
     isProduction: nodeEnv === "production",
     supabase: parseSupabaseConfig(source, nodeEnv),
+    proxy: parseProxyConfig(source),
   };
 }

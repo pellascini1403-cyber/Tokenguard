@@ -4,7 +4,7 @@ import { createSupabaseClients } from "./modules/auth/supabase-client.js";
 
 const env = loadEnv();
 const supabase = createSupabaseClients(env);
-const app = buildApp({ nodeEnv: env.nodeEnv, supabase });
+const app = buildApp({ nodeEnv: env.nodeEnv, supabase, proxy: env.proxy });
 
 async function start(): Promise<void> {
   try {
