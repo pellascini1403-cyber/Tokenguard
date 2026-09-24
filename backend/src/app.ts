@@ -14,6 +14,10 @@ import { createKeysService } from "./modules/keys/keys.service.js";
 import { createRequireTokenGuardKeyHook } from "./modules/keys/tokenguard-key.hook.js";
 import { createAnthropicAdapter } from "./modules/providers/anthropic.adapter.js";
 import { createOpenAiAdapter } from "./modules/providers/openai.adapter.js";
+import { createPricingService } from "./modules/pricing/pricing.service.js";
+import type { ModelPricing } from "./modules/pricing/types.js";
+import { createUsageRecorder } from "./modules/proxy/usage-recorder.js";
+import { createUsageService } from "./modules/usage/usage.service.js";
 import { registerHealthRoute } from "./routes/health.route.js";
 import { registerV1Routes } from "./routes/v1/index.js";
 import type { ErrorResponseBody } from "./types/api.js";
@@ -25,6 +29,9 @@ export interface BuildAppOptions {
   supabase?: SupabaseClients;
   /** Inject proxy config (e.g. fake upstream base URLs for tests). Defaults to env. */
   proxy?: ProxyEnvConfig;
+  /** Inject a deterministic pricing table for tests. Defaults to TokenGuard's
+   * maintained snapshot (src/modules/pricing/pricing-table.ts). */
+  pricingTable?: ModelPricing[];
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -59,6 +66,9 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const organizationsService = createOrganizationsService(supabase.adminClient);
   const keysService = createKeysService(supabase.adminClient);
   const requireTokenGuardKey = createRequireTokenGuardKeyHook(keysService);
+  const usageService = createUsageService(supabase.adminClient);
+  const pricingService = createPricingService(options.pricingTable);
+  const usageRecorder = createUsageRecorder(usageService, pricingService);
 
   registerHealthRoute(app);
   registerV1Routes(app, {
@@ -71,6 +81,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       anthropicAdapter: createAnthropicAdapter(proxyEnv.anthropicBaseUrl),
       requestTimeoutMs: proxyEnv.requestTimeoutMs,
       maxBodyBytes: proxyEnv.maxBodyBytes,
+      usageRecorder,
     },
   });
 

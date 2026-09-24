@@ -54,6 +54,8 @@ function validInput(overrides: Partial<UsageLogInput> = {}): UsageLogInput {
     inputCostUsd: "0.00010000",
     outputCostUsd: "0.00020000",
     totalCostUsd: "0.00030000",
+    usageSource: "provider",
+    pricingVersion: "test-pricing-snapshot",
     durationMs: 250,
     statusCode: 200,
     requestId: randomUUID(),

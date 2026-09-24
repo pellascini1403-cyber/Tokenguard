@@ -6,6 +6,20 @@ export function isProvider(value: string): value is Provider {
   return (PROVIDERS as readonly string[]).includes(value);
 }
 
+export const USAGE_SOURCES = ["provider", "estimated", "unknown"] as const;
+
+/**
+ * Where the token counts on a usage log came from: reported directly by
+ * the AI provider, estimated by TokenGuard (architecture reserved for a
+ * later step — see src/modules/providers usage parsers), or unknown
+ * (neither — token fields are null, never a fake 0).
+ */
+export type UsageSource = (typeof USAGE_SOURCES)[number];
+
+export function isUsageSource(value: string): value is UsageSource {
+  return (USAGE_SOURCES as readonly string[]).includes(value);
+}
+
 /**
  * What the future proxy will pass to `usageService.createUsageLog()` after
  * completing a request. Token counts and cost fields are `null`, never 0,
@@ -28,6 +42,13 @@ export interface UsageLogInput {
   inputCostUsd: string | null;
   outputCostUsd: string | null;
   totalCostUsd: string | null;
+  /** Where the token counts above came from. Never inferred by this module. */
+  usageSource: UsageSource;
+  /** Identifies which pricing snapshot priced this row, or null when no
+   * pricing was available for the model (costs are then also null). Set
+   * once at insert time and never recalculated — a later pricing update
+   * must not change a historical row's cost. */
+  pricingVersion: string | null;
   durationMs: number;
   statusCode: number;
   /** Correlates this log to one proxy request. Must be unique. */

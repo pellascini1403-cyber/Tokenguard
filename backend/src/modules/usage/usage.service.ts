@@ -2,7 +2,7 @@ import { badRequestError } from "../../lib/errors.js";
 import { isUuid } from "../../lib/uuid.js";
 import type { SupabaseAppClient } from "../auth/supabase-client.js";
 import { createUsageRepository } from "./usage.repository.js";
-import { isProvider, PROVIDERS } from "./types.js";
+import { isProvider, isUsageSource, PROVIDERS, USAGE_SOURCES } from "./types.js";
 import type {
   DateRangeFilter,
   PaginatedResult,
@@ -14,6 +14,7 @@ import type {
 } from "./types.js";
 
 const MAX_MODEL_LENGTH = 200;
+const MAX_PRICING_VERSION_LENGTH = 100;
 const MIN_STATUS_CODE = 100;
 const MAX_STATUS_CODE = 599;
 const DECIMAL_STRING_PATTERN = /^\d+(\.\d+)?$/;
@@ -76,6 +77,19 @@ function validateUsageLogInput(input: UsageLogInput): void {
   validateCost("inputCostUsd", input.inputCostUsd);
   validateCost("outputCostUsd", input.outputCostUsd);
   validateCost("totalCostUsd", input.totalCostUsd);
+
+  if (!isUsageSource(input.usageSource)) {
+    throw badRequestError(`usageSource must be one of: ${USAGE_SOURCES.join(", ")}`);
+  }
+  if (
+    input.pricingVersion !== null &&
+    (input.pricingVersion.trim().length === 0 ||
+      input.pricingVersion.length > MAX_PRICING_VERSION_LENGTH)
+  ) {
+    throw badRequestError(
+      `pricingVersion must be a non-empty string of at most ${MAX_PRICING_VERSION_LENGTH} characters, or null`,
+    );
+  }
 
   if (!Number.isInteger(input.durationMs) || input.durationMs < 0) {
     throw badRequestError("durationMs must be a non-negative integer");

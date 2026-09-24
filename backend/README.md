@@ -23,31 +23,61 @@ This service (`backend/`) is the TokenGuard AI API proxy. Over time it will:
 - asynchronously persist usage logs
 - expose usage data to a Next.js dashboard
 
-## Current scope: Step 4 — AI proxy + provider integration
+## Current scope: Step 5 — token tracking + cost calculation
 
 Step 1 established the Fastify/TypeScript foundation. Step 2 added
 Supabase auth, organizations, and TokenGuard API keys. Step 3 added the
-`token_logs` persistence layer (not yet written to by anything). Step 4
-makes TokenGuard forward real, non-streaming requests to OpenAI and
-Anthropic:
+`token_logs` persistence layer. Step 4 made TokenGuard forward real,
+non-streaming requests to OpenAI and Anthropic (`POST /v1/chat/completions`,
+`POST /v1/messages`) through provider adapters. Step 5 closes the loop:
+every completed proxy request now produces a `token_logs` row with
+normalized usage and a calculated cost.
 
-- `POST /v1/chat/completions` (OpenAI-compatible) and `POST /v1/messages`
-  (Anthropic) — see **AI proxy** below
-- provider adapters (`src/modules/providers/`) behind a common
-  `ProviderAdapter` interface, so adding a provider later means writing a
-  new adapter, not touching the routes
-- a request-timeout and body-size-limit policy, both configurable
-- a TokenGuard request ID on every request/response, usable later to
-  correlate a proxy call with its usage log
+- **Usage normalization** (`src/modules/providers/{openai,anthropic}-usage.ts`)
+  maps each provider's own response shape to a common
+  `{ inputTokens, outputTokens, totalTokens, source }`. `source` is
+  `"provider"` when the AI provider reported the numbers, or `"unknown"`
+  when it didn't — token fields are `null` in that case, never a fake `0`.
+  (`"estimated"` — TokenGuard estimating tokens itself — is reserved in
+  the type but not implemented; no tokenizer is wired up yet.)
+- **Pricing engine** (`src/modules/pricing/`) is a small, in-memory,
+  synchronous lookup — no Supabase query on the request path. See
+  **Pricing** below.
+- **Orchestration** (`src/modules/proxy/usage-recorder.ts`) ties the
+  above together after the upstream response is in hand: normalize usage
+  → look up pricing → calculate cost → call the existing
+  `usageService.createUsageLog()` (Step 3) — no SQL in the routes, no
+  duplicated persistence logic. A pricing or persistence failure is
+  logged (never hidden) but never turns a successful AI response into a
+  failed one.
 
-Streaming (`stream: true`) is explicitly rejected with `501` — it lands in
-Step 6. This step does not count tokens, calculate cost, enforce budgets,
-persist usage logs, or add a dashboard; `usageService.createUsageLog()`
-(Step 3) is not called from the proxy yet.
+Streaming (`stream: true`) is still rejected with `501` — it lands in
+Step 6; the usage parsers above are written to be reusable by that flow
+later, but nothing here reads SSE events yet.
+
+## Pricing
+
+`src/modules/pricing/pricing-table.ts` holds TokenGuard's own maintained
+pricing **snapshot** — not a live feed from OpenAI or Anthropic. Every
+entry carries a `pricingVersion`; a usage log persists whichever version
+priced it, so updating this table later never rewrites a historical row's
+cost (`token_logs.pricing_version`). Cost is computed with `decimal.js`,
+never plain floating-point arithmetic:
+
+```
+inputCost  = inputTokens  / 1,000,000 × inputPricePerMillionUsd
+outputCost = outputTokens / 1,000,000 × outputPricePerMillionUsd
+totalCost  = inputCost + outputCost   (only when both halves are known)
+```
+
+A model with no pricing entry does **not** block the request — the proxy
+still forwards it and records usage; `input_cost_usd`, `output_cost_usd`,
+and `total_cost_usd` are simply `null` (and `pricing_version` is `null`)
+for that row, never a fabricated price.
 
 ## Database
 
-Three tables, created by `supabase/migrations/20260924120000_create_core_schema.sql`:
+Core tables, created by `supabase/migrations/20260924120000_create_core_schema.sql`:
 
 - **`organizations`** — `id`, `name`, `monthly_budget_usd` (numeric,
   defaults to 500.00), `created_at`, `updated_at`.
@@ -62,6 +92,14 @@ Three tables, created by `supabase/migrations/20260924120000_create_core_schema.
   from `organization_id`, so deleting an organization also deletes its
   keys. Revocation is a soft delete (`revoked_at` is set, the row is
   kept for audit history).
+- **`token_logs`** (`supabase/migrations/20260925000000_create_token_logs.sql`,
+  extended in `20260926000000_add_usage_source_and_pricing_version.sql`) —
+  one row per completed proxy request: `provider`, `model_used`, nullable
+  `prompt_tokens`/`completion_tokens`/`total_tokens` (`null`, never `0`,
+  when unknown), nullable `input_cost_usd`/`output_cost_usd`/`total_cost_usd`
+  (`numeric(14,8)`), `usage_source` (`provider` | `estimated` | `unknown`),
+  `pricing_version`, `duration_ms`, `status_code`, and a unique `request_id`.
+  Metadata only — no prompts, responses, or credentials.
 
 Organization creation and owner-membership creation happen atomically
 inside a single Postgres function (`create_organization_with_owner`,
@@ -132,17 +170,23 @@ Content-Type: application/json
 invents or defaults one on your behalf. The body is forwarded to
 `ANTHROPIC_BASE_URL/v1/messages` byte for byte.
 
+Every completed request (the provider actually responded, whether with
+success or its own error status) produces a `token_logs` row keyed by the
+`request_id` returned in `X-TokenGuard-Request-Id`. Requests that never
+reach the provider — missing/invalid/revoked `X-TokenGuard-Key`, body too
+large, `stream: true` — do **not** produce a usage log; there is no
+"request" to record usage for.
+
 ### Not yet supported
 
 - **Streaming** (`"stream": true`) is rejected with `501` and
   `{"error":{"code":"STREAMING_NOT_IMPLEMENTED", ...}}`, without
   contacting the provider. Lands in Step 6.
-- Every response carries `X-TokenGuard-Request-Id`. It is not yet linked
-  to a persisted usage log (Step 3's `token_logs` table exists, but the
-  proxy doesn't write to it yet).
 - A request to the provider that times out (`PROVIDER_REQUEST_TIMEOUT_MS`)
   returns `504` / `UPSTREAM_TIMEOUT`; an unreachable provider returns
-  `502` / `UPSTREAM_UNAVAILABLE`. Neither ever includes a credential.
+  `502` / `UPSTREAM_UNAVAILABLE`. Neither ever includes a credential, and
+  neither produces a usage log (TokenGuard never learned what happened
+  upstream, so there is nothing safe to record).
 
 ## Local setup
 
@@ -232,7 +276,6 @@ The AI proxy — see **AI proxy** above.
 
 ## Not implemented yet
 
-Token/cost accounting, agent-loop detection, budget enforcement, usage
-logging (the proxy doesn't call `usageService.createUsageLog()` yet),
-streaming, and the dashboard are **not implemented**. They will be
-addressed in later steps.
+Agent-loop detection, budget enforcement, streaming, asynchronous/queued
+usage persistence (it's synchronous for now), and the dashboard are **not
+implemented**. They will be addressed in later steps.

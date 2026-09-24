@@ -7,6 +7,7 @@ import type {
   UsageLog,
   UsageLogFilter,
   UsageLogInput,
+  UsageSource,
   UsageSummary,
 } from "./types.js";
 
@@ -45,6 +46,8 @@ interface TokenLogRow {
   input_cost_usd: string | null;
   output_cost_usd: string | null;
   total_cost_usd: string | null;
+  usage_source: string;
+  pricing_version: string | null;
   duration_ms: number;
   status_code: number;
   request_id: string;
@@ -73,6 +76,8 @@ function mapRow(row: TokenLogRow): UsageLog {
     inputCostUsd: row.input_cost_usd,
     outputCostUsd: row.output_cost_usd,
     totalCostUsd: row.total_cost_usd,
+    usageSource: row.usage_source as UsageSource,
+    pricingVersion: row.pricing_version,
     durationMs: row.duration_ms,
     statusCode: row.status_code,
     requestId: row.request_id,
@@ -128,6 +133,8 @@ export function createUsageRepository(adminClient: SupabaseAppClient): UsageRepo
           input_cost_usd: input.inputCostUsd,
           output_cost_usd: input.outputCostUsd,
           total_cost_usd: input.totalCostUsd,
+          usage_source: input.usageSource,
+          pricing_version: input.pricingVersion,
           duration_ms: input.durationMs,
           status_code: input.statusCode,
           request_id: input.requestId,
