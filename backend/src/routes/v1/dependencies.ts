@@ -9,6 +9,7 @@ export interface ProxyDependencies {
   openaiAdapter: ProviderAdapter;
   anthropicAdapter: ProviderAdapter;
   requestTimeoutMs: number;
+  streamMaxDurationMs: number;
   maxBodyBytes: number;
   usageRecorder: UsageRecorder;
 }

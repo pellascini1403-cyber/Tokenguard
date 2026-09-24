@@ -1,5 +1,10 @@
 import { parseTokenCount } from "./parse-token-count.js";
-import type { NormalizedUsage, ParsedProviderResponse } from "./usage-types.js";
+import type {
+  NormalizedUsage,
+  ParsedProviderResponse,
+  StreamUsageAccumulator,
+} from "./usage-types.js";
+import type { SseEvent } from "../streaming/types.js";
 
 const UNKNOWN_USAGE: NormalizedUsage = {
   inputTokens: null,
@@ -65,4 +70,76 @@ export function parseAnthropicResponse(
       : requestedModel;
 
   return { model, usage: mapAnthropicUsage(response.usage) };
+}
+
+function readTokenField(rawUsage: unknown, field: string): number | null {
+  if (typeof rawUsage !== "object" || rawUsage === null) {
+    return null;
+  }
+  return parseTokenCount((rawUsage as Record<string, unknown>)[field]);
+}
+
+/**
+ * Consumes Anthropic Messages streaming events as they arrive. Unlike
+ * OpenAI, Anthropic's usage is spread across two event types:
+ * `message_start` carries the initial usage (input_tokens, and usually
+ * an early output_tokens), and one or more `message_delta` events carry
+ * updated, cumulative usage as generation proceeds — the last
+ * `message_delta` before `message_stop` holds the final counts. Each
+ * newly-seen field simply overwrites the running value; nothing is
+ * summed across events, since Anthropic's own counts are already
+ * cumulative.
+ */
+export function createAnthropicStreamUsageAccumulator(
+  requestedModel: string | null,
+): StreamUsageAccumulator {
+  let model: string | null = null;
+  let inputTokens: number | null = null;
+  let outputTokens: number | null = null;
+
+  return {
+    handleEvent(event: SseEvent): void {
+      const data = event.data.trim();
+      if (data === "") {
+        return;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        return; // Malformed event — ignore, never break the stream over it.
+      }
+      if (typeof parsed !== "object" || parsed === null) {
+        return;
+      }
+
+      const payload = parsed as Record<string, unknown>;
+      if (payload.type === "message_start") {
+        const message = payload.message;
+        if (typeof message === "object" && message !== null) {
+          const messageObj = message as Record<string, unknown>;
+          if (typeof messageObj.model === "string" && messageObj.model.length > 0) {
+            model = messageObj.model;
+          }
+          const startInput = readTokenField(messageObj.usage, "input_tokens");
+          const startOutput = readTokenField(messageObj.usage, "output_tokens");
+          if (startInput !== null) inputTokens = startInput;
+          if (startOutput !== null) outputTokens = startOutput;
+        }
+      } else if (payload.type === "message_delta") {
+        const deltaInput = readTokenField(payload.usage, "input_tokens");
+        const deltaOutput = readTokenField(payload.usage, "output_tokens");
+        if (deltaInput !== null) inputTokens = deltaInput;
+        if (deltaOutput !== null) outputTokens = deltaOutput;
+      }
+    },
+    finalize(): ParsedProviderResponse {
+      const usage: NormalizedUsage =
+        inputTokens === null && outputTokens === null
+          ? UNKNOWN_USAGE
+          : mapAnthropicUsage({ input_tokens: inputTokens, output_tokens: outputTokens });
+      return { model: model ?? requestedModel, usage };
+    },
+  };
 }

@@ -23,15 +23,16 @@ This service (`backend/`) is the TokenGuard AI API proxy. Over time it will:
 - asynchronously persist usage logs
 - expose usage data to a Next.js dashboard
 
-## Current scope: Step 5 — token tracking + cost calculation
+## Current scope: Step 6 — streaming (SSE)
 
 Step 1 established the Fastify/TypeScript foundation. Step 2 added
 Supabase auth, organizations, and TokenGuard API keys. Step 3 added the
 `token_logs` persistence layer. Step 4 made TokenGuard forward real,
 non-streaming requests to OpenAI and Anthropic (`POST /v1/chat/completions`,
-`POST /v1/messages`) through provider adapters. Step 5 closes the loop:
-every completed proxy request now produces a `token_logs` row with
-normalized usage and a calculated cost.
+`POST /v1/messages`) through provider adapters. Step 5 made every
+completed proxy request produce a `token_logs` row with normalized usage
+and a calculated cost. Step 6 adds real, live streaming for both
+endpoints: `stream: true` is no longer rejected.
 
 - **Usage normalization** (`src/modules/providers/{openai,anthropic}-usage.ts`)
   maps each provider's own response shape to a common
@@ -39,7 +40,8 @@ normalized usage and a calculated cost.
   `"provider"` when the AI provider reported the numbers, or `"unknown"`
   when it didn't — token fields are `null` in that case, never a fake `0`.
   (`"estimated"` — TokenGuard estimating tokens itself — is reserved in
-  the type but not implemented; no tokenizer is wired up yet.)
+  the type but not implemented; no tokenizer is wired up yet.) The same
+  functions are reused, unchanged, by the streaming accumulators below.
 - **Pricing engine** (`src/modules/pricing/`) is a small, in-memory,
   synchronous lookup — no Supabase query on the request path. See
   **Pricing** below.
@@ -50,10 +52,10 @@ normalized usage and a calculated cost.
   duplicated persistence logic. A pricing or persistence failure is
   logged (never hidden) but never turns a successful AI response into a
   failed one.
-
-Streaming (`stream: true`) is still rejected with `501` — it lands in
-Step 6; the usage parsers above are written to be reusable by that flow
-later, but nothing here reads SSE events yet.
+- **Streaming** (`src/modules/streaming/`, `src/modules/proxy/streaming-proxy.ts`)
+  relays a provider's SSE response to the client live, chunk by chunk, as
+  it arrives — never buffering the full response first. See **Streaming**
+  below.
 
 ## Pricing
 
@@ -74,6 +76,46 @@ A model with no pricing entry does **not** block the request — the proxy
 still forwards it and records usage; `input_cost_usd`, `output_cost_usd`,
 and `total_cost_usd` are simply `null` (and `pricing_version` is `null`)
 for that row, never a fabricated price.
+
+## Streaming
+
+Both proxy endpoints support `"stream": true`. The response is relayed to
+the client as it arrives from the provider — TokenGuard never buffers the
+full response before forwarding.
+
+- **Generic SSE parsing** (`src/modules/streaming/sse-parser.ts`) is a
+  small incremental parser, independent of any provider, that handles
+  `data:`/`event:`/`id:` fields split arbitrarily across network chunk
+  boundaries (including mid-field). It only inspects a transient copy of
+  each chunk to extract usage; the bytes forwarded to the client are the
+  provider's own, unmodified.
+- **OpenAI usage** is _not_ included by default in a streaming response —
+  only if the client's own request body sets
+  `stream_options: {"include_usage": true}` (TokenGuard forwards the
+  body as-is and never adds this itself). If the stream ends without a
+  usage-bearing chunk, the usage log is recorded with `usage_source:
+"unknown"` and `null` token fields — never a fabricated `0`, and never
+  a second request to the provider to "fetch" it afterward.
+- **Anthropic usage** arrives across two event types: `message_start`
+  carries the initial counts, and one or more `message_delta` events
+  carry the running (cumulative) total — the last one before
+  `message_stop` holds the final counts. If none of these ever arrive,
+  usage is recorded as `unknown`, same as OpenAI.
+- **Timeouts**: `PROVIDER_REQUEST_TIMEOUT_MS` still bounds how long
+  TokenGuard waits for the provider to start responding. Once streaming
+  begins, a separate `STREAM_MAX_DURATION_MS` bounds the total time the
+  stream may stay open — a single chunk trickling in does not reset this
+  timer, so a stalled stream can't stay open indefinitely.
+- **Disconnects**: if the client goes away mid-stream, TokenGuard aborts
+  the upstream request rather than letting the provider keep generating
+  for nobody. If the provider disconnects mid-stream instead, TokenGuard
+  ends the client's stream cleanly and records whatever usage had already
+  arrived (or `unknown` if none had).
+- A provider response that never becomes a stream at all (bad
+  credentials, rate limit, malformed body — anything not
+  `text/event-stream`) is relayed exactly like the non-streaming proxy
+  path: status, body, and content-type preserved, one usage log with that
+  status code.
 
 ## Database
 
@@ -153,7 +195,8 @@ Content-Type: application/json
 
 The body is forwarded to `OPENAI_BASE_URL/v1/chat/completions` byte for
 byte — TokenGuard does not parse and reconstruct it. The upstream status
-code, body, and content-type are returned unmodified.
+code, body, and content-type are returned unmodified. Set `"stream": true`
+in the body for a live SSE response — see **Streaming** above.
 
 ### `POST /v1/messages` (Anthropic)
 
@@ -168,20 +211,18 @@ Content-Type: application/json
 
 `anthropic-version` is forwarded when you send it; TokenGuard never
 invents or defaults one on your behalf. The body is forwarded to
-`ANTHROPIC_BASE_URL/v1/messages` byte for byte.
+`ANTHROPIC_BASE_URL/v1/messages` byte for byte. Set `"stream": true` in
+the body for a live SSE response — see **Streaming** above.
 
 Every completed request (the provider actually responded, whether with
-success or its own error status) produces a `token_logs` row keyed by the
-`request_id` returned in `X-TokenGuard-Request-Id`. Requests that never
-reach the provider — missing/invalid/revoked `X-TokenGuard-Key`, body too
-large, `stream: true` — do **not** produce a usage log; there is no
-"request" to record usage for.
+success or its own error status, streaming or not) produces a
+`token_logs` row keyed by the `request_id` returned in
+`X-TokenGuard-Request-Id`. Requests that never reach the provider —
+missing/invalid/revoked `X-TokenGuard-Key`, body too large — do **not**
+produce a usage log; there is no "request" to record usage for.
 
 ### Not yet supported
 
-- **Streaming** (`"stream": true`) is rejected with `501` and
-  `{"error":{"code":"STREAMING_NOT_IMPLEMENTED", ...}}`, without
-  contacting the provider. Lands in Step 6.
 - A request to the provider that times out (`PROVIDER_REQUEST_TIMEOUT_MS`)
   returns `504` / `UPSTREAM_TIMEOUT`; an unreachable provider returns
   `502` / `UPSTREAM_UNAVAILABLE`. Neither ever includes a credential, and
@@ -276,6 +317,6 @@ The AI proxy — see **AI proxy** above.
 
 ## Not implemented yet
 
-Agent-loop detection, budget enforcement, streaming, asynchronous/queued
-usage persistence (it's synchronous for now), and the dashboard are **not
-implemented**. They will be addressed in later steps.
+Agent-loop detection, budget enforcement, advanced rate limiting, alerts,
+asynchronous/queued usage persistence (it's synchronous for now), and the
+dashboard are **not implemented**. They will be addressed in later steps.

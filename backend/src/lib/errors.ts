@@ -28,14 +28,6 @@ export function badRequestError(message: string): AppError {
   return new AppError("BAD_REQUEST", 400, message);
 }
 
-export function streamingNotImplementedError(): AppError {
-  return new AppError(
-    "STREAMING_NOT_IMPLEMENTED",
-    501,
-    "Streaming responses are not yet supported by TokenGuard.",
-  );
-}
-
 export function upstreamTimeoutError(): AppError {
   return new AppError("UPSTREAM_TIMEOUT", 504, "The AI provider did not respond in time.");
 }

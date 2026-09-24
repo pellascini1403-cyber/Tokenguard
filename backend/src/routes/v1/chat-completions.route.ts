@@ -1,20 +1,23 @@
 import { performance } from "node:perf_hooks";
 import type { FastifyInstance } from "fastify";
 import { unauthorizedError } from "../../lib/errors.js";
-import { parseOpenAiResponse } from "../../modules/providers/openai-usage.js";
+import {
+  createOpenAiStreamUsageAccumulator,
+  parseOpenAiResponse,
+} from "../../modules/providers/openai-usage.js";
 import { inspectProxyRequestBody } from "../../modules/providers/request-body.js";
 import { runProviderRequest } from "../../modules/providers/provider-request-runner.js";
+import { handleStreamingProxyRequest } from "../../modules/proxy/streaming-proxy.js";
 import { recordProxyUsageSafely } from "../../modules/proxy/usage-recorder.js";
 import type { ProxyRequestContext } from "../../modules/proxy/types.js";
 import type { V1RouteDependencies } from "./dependencies.js";
 
 /**
- * OpenAI-compatible Chat Completions proxy. Transparent for non-streaming
- * requests: the client's body is forwarded unmodified, and the upstream
- * status/body/content-type are relayed back unmodified. Usage/cost
- * tracking (Step 5) happens after the upstream response is in hand and
- * never delays or risks the client's response — a pricing or persistence
- * failure is logged, never surfaced to the caller.
+ * OpenAI-compatible Chat Completions proxy. Non-streaming requests are
+ * transparent and buffered (Step 4/5, unchanged); `stream: true` requests
+ * (Step 6) are relayed live via the shared streaming orchestration —
+ * this route only supplies what's OpenAI-specific: the adapter and the
+ * usage parser/accumulator.
  */
 export function registerChatCompletionsRoute(
   app: FastifyInstance,
@@ -29,7 +32,7 @@ export function registerChatCompletionsRoute(
     async (request, reply) => {
       const startedAt = performance.now();
       const rawBody = request.body as Buffer;
-      const { requestedModel } = inspectProxyRequestBody(rawBody);
+      const { requestedModel, isStreaming } = inspectProxyRequestBody(rawBody);
 
       const tokenGuardContext = request.tokenGuardContext;
       if (!tokenGuardContext) {
@@ -37,13 +40,6 @@ export function registerChatCompletionsRoute(
         // before the handler runs. Defensive only, mirrors me.route.ts.
         throw unauthorizedError();
       }
-
-      const result = await runProviderRequest(
-        deps.proxy.openaiAdapter,
-        { body: rawBody, clientHeaders: request.headers },
-        deps.proxy.requestTimeoutMs,
-      );
-      const durationMs = Math.round(performance.now() - startedAt);
 
       const context: ProxyRequestContext = {
         requestId: request.id,
@@ -53,6 +49,30 @@ export function registerChatCompletionsRoute(
         requestedModel,
         startedAt,
       };
+
+      if (isStreaming) {
+        return handleStreamingProxyRequest({
+          request,
+          reply,
+          adapter: deps.proxy.openaiAdapter,
+          rawBody,
+          requestedModel,
+          connectTimeoutMs: deps.proxy.requestTimeoutMs,
+          streamMaxDurationMs: deps.proxy.streamMaxDurationMs,
+          usageRecorder: deps.proxy.usageRecorder,
+          context,
+          parseBufferedResponse: parseOpenAiResponse,
+          createStreamAccumulator: createOpenAiStreamUsageAccumulator,
+        });
+      }
+
+      const result = await runProviderRequest(
+        deps.proxy.openaiAdapter,
+        { body: rawBody, clientHeaders: request.headers },
+        deps.proxy.requestTimeoutMs,
+      );
+      const durationMs = Math.round(performance.now() - startedAt);
+
       await recordProxyUsageSafely(
         deps.proxy.usageRecorder,
         {

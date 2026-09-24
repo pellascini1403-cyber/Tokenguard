@@ -61,6 +61,7 @@ async function buildTestApp(
       openaiBaseUrl: options.openaiUrl ?? "http://127.0.0.1:1",
       anthropicBaseUrl: options.anthropicUrl ?? "http://127.0.0.1:1",
       requestTimeoutMs: 5_000,
+      streamMaxDurationMs: 5_000,
       maxBodyBytes: 1_000_000,
     },
   });
@@ -214,20 +215,9 @@ describe("usage tracking — OpenAI", () => {
     expect(store.token_logs).toHaveLength(0);
   });
 
-  it("does not create a usage log when streaming is rejected", async () => {
-    upstream = await startFakeUpstreamServer();
-    ({ app, tokenGuardKey, store } = await buildTestApp({ openaiUrl: upstream.url }));
-
-    const res = await app.inject({
-      method: "POST",
-      url: "/v1/chat/completions",
-      headers: CHAT_HEADERS(tokenGuardKey),
-      payload: JSON.stringify({ model: "gpt-priced", stream: true, messages: [] }),
-    });
-
-    expect(res.statusCode).toBe(501);
-    expect(store.token_logs).toHaveLength(0);
-  });
+  // Streaming (`stream: true`) is now fully implemented — see
+  // tests/routes/proxy-streaming.test.ts for its own usage-logging
+  // coverage (including the "no usage log" cases specific to streaming).
 
   it("does not persist secrets, prompt, or response content in the usage log", async () => {
     const promptMarker = "MARKER-PROMPT-CONTENT";
@@ -396,6 +386,7 @@ describe("usage tracking — multi-tenant isolation", () => {
         openaiBaseUrl: upstream.url,
         anthropicBaseUrl: upstream.url,
         requestTimeoutMs: 5_000,
+        streamMaxDurationMs: 5_000,
         maxBodyBytes: 1_000_000,
       },
     });

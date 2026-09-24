@@ -1,6 +1,11 @@
 import { badRequestError } from "../../lib/errors.js";
 import { getClientHeader } from "./client-headers.js";
-import type { ProviderAdapter, ProviderForwardInput, ProviderForwardResult } from "./types.js";
+import type {
+  ProviderAdapter,
+  ProviderForwardInput,
+  ProviderForwardResult,
+  ProviderStreamForwardResult,
+} from "./types.js";
 
 const MESSAGES_PATH = "/v1/messages";
 
@@ -12,28 +17,31 @@ const MESSAGES_PATH = "/v1/messages";
  * never invents or defaults a version on the client's behalf.
  */
 export function createAnthropicAdapter(baseUrl: string): ProviderAdapter {
+  function buildHeaders(
+    clientHeaders: ProviderForwardInput["clientHeaders"],
+  ): Record<string, string> {
+    const apiKey = getClientHeader(clientHeaders, "x-api-key");
+    if (!apiKey) {
+      throw badRequestError("Missing x-api-key header for Anthropic");
+    }
+    const headers: Record<string, string> = {
+      "x-api-key": apiKey,
+      "content-type": "application/json",
+    };
+    const anthropicVersion = getClientHeader(clientHeaders, "anthropic-version");
+    if (anthropicVersion) {
+      headers["anthropic-version"] = anthropicVersion;
+    }
+    return headers;
+  }
+
   return {
     provider: "anthropic",
 
     async forward(input: ProviderForwardInput): Promise<ProviderForwardResult> {
-      const apiKey = getClientHeader(input.clientHeaders, "x-api-key");
-      if (!apiKey) {
-        throw badRequestError("Missing x-api-key header for Anthropic");
-      }
-
-      const headers: Record<string, string> = {
-        "x-api-key": apiKey,
-        "content-type": "application/json",
-      };
-      const anthropicVersion = getClientHeader(input.clientHeaders, "anthropic-version");
-      if (anthropicVersion) {
-        headers["anthropic-version"] = anthropicVersion;
-      }
-
-      const upstreamUrl = new URL(MESSAGES_PATH, baseUrl);
-      const response = await fetch(upstreamUrl, {
+      const response = await fetch(new URL(MESSAGES_PATH, baseUrl), {
         method: "POST",
-        headers,
+        headers: buildHeaders(input.clientHeaders),
         body: input.body,
         signal: input.signal,
       });
@@ -43,6 +51,21 @@ export function createAnthropicAdapter(baseUrl: string): ProviderAdapter {
         status: response.status,
         body,
         contentType: response.headers.get("content-type"),
+      };
+    },
+
+    async forwardStream(input: ProviderForwardInput): Promise<ProviderStreamForwardResult> {
+      const response = await fetch(new URL(MESSAGES_PATH, baseUrl), {
+        method: "POST",
+        headers: buildHeaders(input.clientHeaders),
+        body: input.body,
+        signal: input.signal,
+      });
+
+      return {
+        status: response.status,
+        contentType: response.headers.get("content-type"),
+        body: response.body,
       };
     },
   };

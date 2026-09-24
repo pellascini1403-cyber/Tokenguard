@@ -80,6 +80,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       openaiAdapter: createOpenAiAdapter(proxyEnv.openaiBaseUrl),
       anthropicAdapter: createAnthropicAdapter(proxyEnv.anthropicBaseUrl),
       requestTimeoutMs: proxyEnv.requestTimeoutMs,
+      streamMaxDurationMs: proxyEnv.streamMaxDurationMs,
       maxBodyBytes: proxyEnv.maxBodyBytes,
       usageRecorder,
     },
@@ -109,8 +110,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     // pre-vetted message (see lib/errors.ts) — safe to expose regardless
     // of status code, unlike an unexpected 5xx from a genuine bug. This
     // matters from Step 4 onward: upstream-timeout/unavailable errors are
-    // deliberate 502/504 AppErrors whose specific code the caller needs
-    // (e.g. STREAMING_NOT_IMPLEMENTED), not a generic "Internal server error".
+    // deliberate 502/504 AppErrors whose specific code the caller needs,
+    // not a generic "Internal server error".
     const isKnownError = error instanceof AppError;
 
     const body: ErrorResponseBody = {

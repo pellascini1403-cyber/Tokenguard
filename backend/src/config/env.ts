@@ -19,8 +19,15 @@ export interface ProxyEnvConfig {
   openaiBaseUrl: string;
   /** Upstream base URL for Anthropic requests. Not secret. */
   anthropicBaseUrl: string;
-  /** How long the proxy waits for an upstream provider response before aborting. */
+  /** How long the proxy waits for an upstream provider response (connect/
+   * headers phase) before aborting. Applies to both non-streaming
+   * requests and the connect phase of a streaming request. */
   requestTimeoutMs: number;
+  /** Hard ceiling on how long a single SSE stream may stay open, once it
+   * has started. Independent of requestTimeoutMs — a chunk arriving does
+   * not reset this timer, so a slow-trickling stream cannot stay open
+   * indefinitely. */
+  streamMaxDurationMs: number;
   /** Maximum accepted request body size for proxy endpoints, in bytes. */
   maxBodyBytes: number;
 }
@@ -87,6 +94,10 @@ const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 // against arbitrarily large request bodies.
 const DEFAULT_MAX_PROXY_BODY_BYTES = 5 * 1024 * 1024;
 const DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS = 30_000;
+// Generous enough for a long generation (reasoning models can run for
+// minutes) while still guaranteeing a streaming connection cannot stay
+// open forever just by trickling occasional bytes.
+const DEFAULT_STREAM_MAX_DURATION_MS = 300_000;
 
 function parseBaseUrl(value: string | undefined, defaultValue: string, label: string): string {
   const url = value && value.length > 0 ? value : defaultValue;
@@ -121,6 +132,11 @@ function parseProxyConfig(source: NodeJS.ProcessEnv): ProxyEnvConfig {
       source.PROVIDER_REQUEST_TIMEOUT_MS,
       DEFAULT_PROVIDER_REQUEST_TIMEOUT_MS,
       "PROVIDER_REQUEST_TIMEOUT_MS",
+    ),
+    streamMaxDurationMs: parsePositiveInt(
+      source.STREAM_MAX_DURATION_MS,
+      DEFAULT_STREAM_MAX_DURATION_MS,
+      "STREAM_MAX_DURATION_MS",
     ),
     maxBodyBytes: parsePositiveInt(
       source.MAX_PROXY_BODY_BYTES,

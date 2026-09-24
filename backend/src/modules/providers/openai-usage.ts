@@ -1,5 +1,10 @@
 import { parseTokenCount } from "./parse-token-count.js";
-import type { NormalizedUsage, ParsedProviderResponse } from "./usage-types.js";
+import type {
+  NormalizedUsage,
+  ParsedProviderResponse,
+  StreamUsageAccumulator,
+} from "./usage-types.js";
+import type { SseEvent } from "../streaming/types.js";
 
 const UNKNOWN_USAGE: NormalizedUsage = {
   inputTokens: null,
@@ -63,4 +68,52 @@ export function parseOpenAiResponse(
       : requestedModel;
 
   return { model, usage: mapOpenAiUsage(response.usage) };
+}
+
+/**
+ * Consumes OpenAI Chat Completions streaming events as they arrive.
+ * Usage is NOT automatic: OpenAI only includes a final chunk with a
+ * top-level `usage` field when the client requests it (via
+ * `stream_options: {"include_usage": true}` in the request body).
+ * TokenGuard forwards the client's body unmodified (per the proxy's
+ * transparency contract) and never injects that option itself — so if
+ * the client didn't ask for it, no chunk will ever carry usage, and
+ * `finalize()` correctly yields `source: "unknown"`. There is no second
+ * request to the provider to "fetch" usage after the fact.
+ */
+export function createOpenAiStreamUsageAccumulator(
+  requestedModel: string | null,
+): StreamUsageAccumulator {
+  let model: string | null = null;
+  let usage: NormalizedUsage = UNKNOWN_USAGE;
+
+  return {
+    handleEvent(event: SseEvent): void {
+      const data = event.data.trim();
+      if (data === "" || data === "[DONE]") {
+        return;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        return; // Malformed chunk — ignore, never break the stream over it.
+      }
+      if (typeof parsed !== "object" || parsed === null) {
+        return;
+      }
+
+      const chunk = parsed as Record<string, unknown>;
+      if (model === null && typeof chunk.model === "string" && chunk.model.length > 0) {
+        model = chunk.model;
+      }
+      if (chunk.usage !== undefined) {
+        usage = mapOpenAiUsage(chunk.usage);
+      }
+    },
+    finalize(): ParsedProviderResponse {
+      return { model: model ?? requestedModel, usage };
+    },
+  };
 }

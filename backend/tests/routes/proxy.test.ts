@@ -20,6 +20,7 @@ interface TestAppOptions {
   openaiUrl?: string;
   anthropicUrl?: string;
   requestTimeoutMs?: number;
+  streamMaxDurationMs?: number;
   maxBodyBytes?: number;
   logger?: ReturnType<typeof createLogCollector>["logger"];
 }
@@ -40,6 +41,7 @@ async function buildTestApp(
       openaiBaseUrl: options.openaiUrl ?? "http://127.0.0.1:1",
       anthropicBaseUrl: options.anthropicUrl ?? "http://127.0.0.1:1",
       requestTimeoutMs: options.requestTimeoutMs ?? 5_000,
+      streamMaxDurationMs: options.streamMaxDurationMs ?? 5_000,
       maxBodyBytes: options.maxBodyBytes ?? 1_000_000,
     },
   });
@@ -114,6 +116,7 @@ describe("TokenGuard authentication for proxy routes", () => {
         openaiBaseUrl: upstream.url,
         anthropicBaseUrl: upstream.url,
         requestTimeoutMs: 5_000,
+        streamMaxDurationMs: 5_000,
         maxBodyBytes: 1_000_000,
       },
     });
@@ -147,6 +150,7 @@ describe("TokenGuard authentication for proxy routes", () => {
         openaiBaseUrl: upstream.url,
         anthropicBaseUrl: upstream.url,
         requestTimeoutMs: 5_000,
+        streamMaxDurationMs: 5_000,
         maxBodyBytes: 1_000_000,
       },
     });
@@ -461,58 +465,9 @@ describe("Anthropic proxy (POST /v1/messages)", () => {
   });
 });
 
-describe("streaming is rejected", () => {
-  let upstream: FakeUpstreamServer;
-  let app: FastifyInstance;
-  let tokenGuardKey: string;
-
-  beforeEach(async () => {
-    upstream = await startFakeUpstreamServer();
-    ({ app, tokenGuardKey } = await buildTestApp({
-      openaiUrl: upstream.url,
-      anthropicUrl: upstream.url,
-    }));
-  });
-
-  afterEach(async () => {
-    await app.close();
-    await upstream.close();
-  });
-
-  it("rejects stream: true for OpenAI without contacting the upstream", async () => {
-    const res = await app.inject({
-      method: "POST",
-      url: "/v1/chat/completions",
-      headers: {
-        "content-type": "application/json",
-        authorization: "Bearer sk-openai-test",
-        "x-tokenguard-key": tokenGuardKey,
-      },
-      payload: JSON.stringify({ model: "gpt-4o", stream: true, messages: [] }),
-    });
-
-    expect(res.statusCode).toBe(501);
-    expect(parseBody(res)).toMatchObject({ error: { code: "STREAMING_NOT_IMPLEMENTED" } });
-    expect(upstream.requests).toHaveLength(0);
-  });
-
-  it("rejects stream: true for Anthropic without contacting the upstream", async () => {
-    const res = await app.inject({
-      method: "POST",
-      url: "/v1/messages",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": "sk-ant-test",
-        "x-tokenguard-key": tokenGuardKey,
-      },
-      payload: JSON.stringify({ model: "claude-sonnet-5", stream: true, messages: [] }),
-    });
-
-    expect(res.statusCode).toBe(501);
-    expect(parseBody(res)).toMatchObject({ error: { code: "STREAMING_NOT_IMPLEMENTED" } });
-    expect(upstream.requests).toHaveLength(0);
-  });
-});
+// Streaming (`stream: true`) is now fully implemented — see
+// tests/routes/proxy-streaming.test.ts. This file continues to cover only
+// the non-streaming proxy path, which Step 6 leaves unchanged.
 
 describe("upstream timeout", () => {
   let upstream: FakeUpstreamServer;

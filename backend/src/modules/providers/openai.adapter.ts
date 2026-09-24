@@ -1,6 +1,11 @@
 import { badRequestError } from "../../lib/errors.js";
 import { getClientHeader } from "./client-headers.js";
-import type { ProviderAdapter, ProviderForwardInput, ProviderForwardResult } from "./types.js";
+import type {
+  ProviderAdapter,
+  ProviderForwardInput,
+  ProviderForwardResult,
+  ProviderStreamForwardResult,
+} from "./types.js";
 
 const CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
 
@@ -11,22 +16,23 @@ const CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
  * back.
  */
 export function createOpenAiAdapter(baseUrl: string): ProviderAdapter {
+  function buildHeaders(
+    clientHeaders: ProviderForwardInput["clientHeaders"],
+  ): Record<string, string> {
+    const authorization = getClientHeader(clientHeaders, "authorization");
+    if (!authorization) {
+      throw badRequestError("Missing Authorization header for OpenAI");
+    }
+    return { authorization, "content-type": "application/json" };
+  }
+
   return {
     provider: "openai",
 
     async forward(input: ProviderForwardInput): Promise<ProviderForwardResult> {
-      const authorization = getClientHeader(input.clientHeaders, "authorization");
-      if (!authorization) {
-        throw badRequestError("Missing Authorization header for OpenAI");
-      }
-
-      const upstreamUrl = new URL(CHAT_COMPLETIONS_PATH, baseUrl);
-      const response = await fetch(upstreamUrl, {
+      const response = await fetch(new URL(CHAT_COMPLETIONS_PATH, baseUrl), {
         method: "POST",
-        headers: {
-          authorization,
-          "content-type": "application/json",
-        },
+        headers: buildHeaders(input.clientHeaders),
         body: input.body,
         signal: input.signal,
       });
@@ -36,6 +42,21 @@ export function createOpenAiAdapter(baseUrl: string): ProviderAdapter {
         status: response.status,
         body,
         contentType: response.headers.get("content-type"),
+      };
+    },
+
+    async forwardStream(input: ProviderForwardInput): Promise<ProviderStreamForwardResult> {
+      const response = await fetch(new URL(CHAT_COMPLETIONS_PATH, baseUrl), {
+        method: "POST",
+        headers: buildHeaders(input.clientHeaders),
+        body: input.body,
+        signal: input.signal,
+      });
+
+      return {
+        status: response.status,
+        contentType: response.headers.get("content-type"),
+        body: response.body,
       };
     },
   };

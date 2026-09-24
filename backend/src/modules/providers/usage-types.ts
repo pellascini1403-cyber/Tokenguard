@@ -1,3 +1,4 @@
+import type { SseEvent } from "../streaming/types.js";
 import type { UsageSource } from "../usage/types.js";
 
 export type { UsageSource };
@@ -20,4 +21,20 @@ export interface NormalizedUsage {
 export interface ParsedProviderResponse {
   model: string | null;
   usage: NormalizedUsage;
+}
+
+/**
+ * The streaming counterpart of parseOpenAiResponse/parseAnthropicResponse
+ * (which parse one complete JSON body): consumes SSE events one at a
+ * time as they arrive, and produces the same ParsedProviderResponse once
+ * the stream ends. Provider-specific (each provider streams a different
+ * event shape) — the generic SSE transport (src/modules/streaming) never
+ * implements this itself, only calls it.
+ */
+export interface StreamUsageAccumulator {
+  /** Never throws — a malformed or unexpected event is ignored rather
+   * than aborting the stream, since a usage-extraction failure must
+   * never break the client's already-flowing response. */
+  handleEvent(event: SseEvent): void;
+  finalize(): ParsedProviderResponse;
 }
