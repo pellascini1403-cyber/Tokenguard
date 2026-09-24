@@ -1,10 +1,17 @@
 import type { FastifyInstance } from "fastify";
+import { registerMeRoute } from "./me.route.js";
+import { registerOrganizationsRoutes } from "./organizations.route.js";
+import { registerOrganizationKeysRoutes } from "./organization-keys.route.js";
+import type { V1RouteDependencies } from "./dependencies.js";
+
+export type { V1RouteDependencies } from "./dependencies.js";
 
 /**
- * Registration point for the future /v1 AI proxy API (e.g. /v1/chat/completions).
- * Intentionally empty in Step 1 — no proxy behavior exists yet, and this must
- * not expose any endpoint until it is implemented in a later step.
+ * Registers the Step 2 authentication/organization API. The future AI
+ * proxy (e.g. /v1/chat/completions) is NOT implemented here yet.
  */
-export function registerV1Routes(_app: FastifyInstance): void {
-  // No /v1 routes are implemented yet.
+export function registerV1Routes(app: FastifyInstance, deps: V1RouteDependencies): void {
+  registerMeRoute(app, deps);
+  registerOrganizationsRoutes(app, deps);
+  registerOrganizationKeysRoutes(app, deps);
 }

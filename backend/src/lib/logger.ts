@@ -9,6 +9,7 @@ const REDACTED_PATHS = [
   "req.headers.cookie",
   "req.headers['x-api-key']",
   "req.headers['x-tokenguard-api-key']",
+  "req.headers['x-tokenguard-key']",
   "req.body",
   "res.body",
 ];

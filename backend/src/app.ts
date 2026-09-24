@@ -3,8 +3,12 @@ import Fastify, {
   type FastifyInstance,
   type FastifyServerOptions,
 } from "fastify";
-import type { NodeEnv } from "./config/env.js";
+import { loadEnv, type NodeEnv } from "./config/env.js";
 import { buildLoggerOptions } from "./lib/logger.js";
+import { createRequireAuthHook } from "./modules/auth/auth.hook.js";
+import { createSupabaseClients, type SupabaseClients } from "./modules/auth/supabase-client.js";
+import { createOrganizationsService } from "./modules/organizations/organizations.service.js";
+import { createKeysService } from "./modules/keys/keys.service.js";
 import { registerHealthRoute } from "./routes/health.route.js";
 import { registerV1Routes } from "./routes/v1/index.js";
 import type { ErrorResponseBody } from "./types/api.js";
@@ -12,6 +16,8 @@ import type { ErrorResponseBody } from "./types/api.js";
 export interface BuildAppOptions {
   nodeEnv?: NodeEnv;
   logger?: FastifyServerOptions["logger"];
+  /** Inject fake/test Supabase clients. Defaults to real clients built from env. */
+  supabase?: SupabaseClients;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -19,8 +25,13 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     logger: options.logger ?? buildLoggerOptions(options.nodeEnv ?? "development"),
   });
 
+  const supabase = options.supabase ?? createSupabaseClients(loadEnv());
+  const requireAuth = createRequireAuthHook(supabase.authClient);
+  const organizationsService = createOrganizationsService(supabase.adminClient);
+  const keysService = createKeysService(supabase.adminClient);
+
   registerHealthRoute(app);
-  registerV1Routes(app);
+  registerV1Routes(app, { requireAuth, organizationsService, keysService });
 
   app.setNotFoundHandler((request, reply) => {
     const body: ErrorResponseBody = {
