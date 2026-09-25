@@ -12,6 +12,8 @@ import { createSupabaseClients, type SupabaseClients } from "./modules/auth/supa
 import { createOrganizationsService } from "./modules/organizations/organizations.service.js";
 import { createKeysService } from "./modules/keys/keys.service.js";
 import { createRequireTokenGuardKeyHook } from "./modules/keys/tokenguard-key.hook.js";
+import { createLoopDetector } from "./modules/loop-detection/loop-detector.js";
+import type { LoopDetectionConfig } from "./modules/loop-detection/types.js";
 import { createAnthropicAdapter } from "./modules/providers/anthropic.adapter.js";
 import { createOpenAiAdapter } from "./modules/providers/openai.adapter.js";
 import { createPricingService } from "./modules/pricing/pricing.service.js";
@@ -32,6 +34,11 @@ export interface BuildAppOptions {
   /** Inject a deterministic pricing table for tests. Defaults to TokenGuard's
    * maintained snapshot (src/modules/pricing/pricing-table.ts). */
   pricingTable?: ModelPricing[];
+  /** Inject loop-detection thresholds (e.g. a tiny threshold/window for
+   * fast, deterministic tests). Defaults to env. One detector instance
+   * (and its in-memory state) is created per buildApp() call and shared
+   * by both proxy routes — see modules/loop-detection. */
+  loopDetection?: LoopDetectionConfig;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -61,6 +68,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
 
   const supabase = options.supabase ?? createSupabaseClients(getEnv());
   const proxyEnv = options.proxy ?? getEnv().proxy;
+  const loopDetectionConfig = options.loopDetection ?? getEnv().loopDetection;
 
   const requireAuth = createRequireAuthHook(supabase.authClient);
   const organizationsService = createOrganizationsService(supabase.adminClient);
@@ -69,6 +77,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const usageService = createUsageService(supabase.adminClient);
   const pricingService = createPricingService(options.pricingTable);
   const usageRecorder = createUsageRecorder(usageService, pricingService);
+  const loopDetector = createLoopDetector(loopDetectionConfig);
 
   registerHealthRoute(app);
   registerV1Routes(app, {
@@ -83,6 +92,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       streamMaxDurationMs: proxyEnv.streamMaxDurationMs,
       maxBodyBytes: proxyEnv.maxBodyBytes,
       usageRecorder,
+      loopDetector,
     },
   });
 

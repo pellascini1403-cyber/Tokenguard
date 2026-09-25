@@ -7,10 +7,13 @@ import {
 } from "../../modules/providers/openai-usage.js";
 import { inspectProxyRequestBody } from "../../modules/providers/request-body.js";
 import { runProviderRequest } from "../../modules/providers/provider-request-runner.js";
+import { enforceLoopDetection } from "../../modules/proxy/loop-guard.js";
 import { handleStreamingProxyRequest } from "../../modules/proxy/streaming-proxy.js";
 import { recordProxyUsageSafely } from "../../modules/proxy/usage-recorder.js";
 import type { ProxyRequestContext } from "../../modules/proxy/types.js";
 import type { V1RouteDependencies } from "./dependencies.js";
+
+const ENDPOINT = "/v1/chat/completions";
 
 /**
  * OpenAI-compatible Chat Completions proxy. Non-streaming requests are
@@ -24,7 +27,7 @@ export function registerChatCompletionsRoute(
   deps: V1RouteDependencies,
 ): void {
   app.post(
-    "/v1/chat/completions",
+    ENDPOINT,
     {
       bodyLimit: deps.proxy.maxBodyBytes,
       preHandler: deps.proxy.requireTokenGuardKey,
@@ -32,7 +35,7 @@ export function registerChatCompletionsRoute(
     async (request, reply) => {
       const startedAt = performance.now();
       const rawBody = request.body as Buffer;
-      const { requestedModel, isStreaming } = inspectProxyRequestBody(rawBody);
+      const { requestedModel, isStreaming, parsedBody } = inspectProxyRequestBody(rawBody);
 
       const tokenGuardContext = request.tokenGuardContext;
       if (!tokenGuardContext) {
@@ -49,6 +52,27 @@ export function registerChatCompletionsRoute(
         requestedModel,
         startedAt,
       };
+
+      // Loop detection runs before any upstream contact — a blocked
+      // signature never reaches the provider and never produces a usage
+      // log (see modules/proxy/loop-guard.ts).
+      const loopDecision = enforceLoopDetection(
+        {
+          detector: deps.proxy.loopDetector,
+          organizationId: context.organizationId,
+          tokenGuardKeyId: context.tokenGuardKeyId,
+          provider: context.provider,
+          endpoint: ENDPOINT,
+          requestedModel,
+          parsedBody,
+          requestId: context.requestId,
+        },
+        reply,
+        request.log,
+      );
+      if (loopDecision.blocked) {
+        return;
+      }
 
       if (isStreaming) {
         return handleStreamingProxyRequest({

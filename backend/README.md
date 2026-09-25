@@ -23,7 +23,7 @@ This service (`backend/`) is the TokenGuard AI API proxy. Over time it will:
 - asynchronously persist usage logs
 - expose usage data to a Next.js dashboard
 
-## Current scope: Step 6 — streaming (SSE)
+## Current scope: Step 7 — agent loop detection
 
 Step 1 established the Fastify/TypeScript foundation. Step 2 added
 Supabase auth, organizations, and TokenGuard API keys. Step 3 added the
@@ -31,8 +31,10 @@ Supabase auth, organizations, and TokenGuard API keys. Step 3 added the
 non-streaming requests to OpenAI and Anthropic (`POST /v1/chat/completions`,
 `POST /v1/messages`) through provider adapters. Step 5 made every
 completed proxy request produce a `token_logs` row with normalized usage
-and a calculated cost. Step 6 adds real, live streaming for both
-endpoints: `stream: true` is no longer rejected.
+and a calculated cost. Step 6 added real, live streaming for both
+endpoints. Step 7 adds a lightweight anti-loop mechanism that blocks
+rapid repetition of effectively identical requests before they become an
+expensive API-cost problem.
 
 - **Usage normalization** (`src/modules/providers/{openai,anthropic}-usage.ts`)
   maps each provider's own response shape to a common
@@ -56,6 +58,10 @@ endpoints: `stream: true` is no longer rejected.
   relays a provider's SSE response to the client live, chunk by chunk, as
   it arrives — never buffering the full response first. See **Streaming**
   below.
+- **Agent loop detection** (`src/modules/loop-detection/`,
+  `src/modules/proxy/loop-guard.ts`) hashes a privacy-safe signature of
+  each request and blocks it with `429` once it repeats too fast, before
+  the provider is ever contacted. See **Agent loop detection** below.
 
 ## Pricing
 
@@ -116,6 +122,71 @@ full response before forwarding.
   `text/event-stream`) is relayed exactly like the non-streaming proxy
   path: status, body, and content-type preserved, one usage log with that
   status code.
+
+## Agent loop detection
+
+Both proxy endpoints are guarded by a lightweight, conservative anti-loop
+check: rapid repetition of the _effectively identical_ request, from the
+same organization and TokenGuard key, is blocked before it ever reaches
+the provider. The goal is catching a runaway agent (a broken retry loop,
+a tool call stuck repeating itself) before it turns into an API bill —
+not rate-limiting normal traffic. Using the same model or endpoint
+repeatedly is never, by itself, treated as a loop.
+
+- **What counts as "repeated"**: a request is identified by a SHA-256
+  signature over `{ organizationId, tokenGuardKeyId, provider, endpoint,
+model, normalizedBody }`. The body is normalized (JSON keys sorted
+  recursively, array order preserved) before hashing, so formatting
+  differences like key order don't create a false miss — but any
+  meaningfully different content (a different prompt, a different
+  parameter) produces a different signature and is never conflated with
+  a loop. Two different organizations or TokenGuard keys never share
+  loop state, even for byte-identical bodies.
+- **Thresholds** (`src/modules/loop-detection/configuration.ts`,
+  overridable via env — see below): by default, up to 5 identical
+  requests within a 10-second window are allowed; the 6th is treated as
+  a loop and that exact signature is blocked for 30 seconds. Once the
+  block expires, normal evaluation resumes from a clean count — a loop
+  that stops looping is never punished forever.
+- **In-memory, bounded, process-local** (`src/modules/loop-detection/loop-detector.ts`):
+  a single `Map` keyed by signature, storing only
+  `{ count, firstSeenAt, lastSeenAt, blockedUntil }` — never the request
+  body, prompt, or anything derived from it beyond the hash itself.
+  Bounded by `AGENT_LOOP_MAX_ENTRIES` (oldest entries evicted first once
+  full); stale entries (outside the window, not currently blocked) are
+  swept out periodically so the detector cannot leak memory over the
+  life of the process. No Supabase query and no database table are
+  involved — the check is a single synchronous in-memory operation, fast
+  enough to sit directly in the request path.
+- **Process-local — not distributed**: this state lives in one running
+  Node.js process. Running multiple TokenGuard instances behind a load
+  balancer means each instance counts independently; a loop whose
+  requests happen to be spread across instances could exceed the
+  configured threshold before any single instance blocks it. This step
+  deliberately does not implement cross-instance/distributed loop
+  detection.
+- **Concurrency**: the check-and-record step is one synchronous function
+  call with no `await` inside it, so Node.js can never interleave two
+  concurrent requests for the same signature mid-check — there's no
+  window for a burst of simultaneous identical requests to all read the
+  same pre-increment count and all pass. No external locking is used or
+  needed for this.
+- **Blocked response**: `429` with
+  `{"error":{"code":"AGENT_LOOP_DETECTED","message":"...","retryAfterSeconds":<n>}}`
+  and a `Retry-After` header — never the request body, the signature, or
+  any credential. The provider is never contacted for a blocked request,
+  so it never produces a `token_logs` row (same as any other request
+  that never reached the provider). A blocked event is logged as
+  structured metadata only (request id, organization id, key id,
+  provider, endpoint, model, error code) — never the request/response
+  content or the signature itself.
+- Applies identically to OpenAI and Anthropic, and to both streaming and
+  non-streaming requests — one shared detector and one shared code path,
+  not duplicated per provider.
+
+Configuration (`.env.example`): `AGENT_LOOP_WINDOW_MS` (default `10000`),
+`AGENT_LOOP_THRESHOLD` (default `5`), `AGENT_LOOP_BLOCK_DURATION_MS`
+(default `30000`), `AGENT_LOOP_MAX_ENTRIES` (default `10000`).
 
 ## Database
 
@@ -218,8 +289,9 @@ Every completed request (the provider actually responded, whether with
 success or its own error status, streaming or not) produces a
 `token_logs` row keyed by the `request_id` returned in
 `X-TokenGuard-Request-Id`. Requests that never reach the provider —
-missing/invalid/revoked `X-TokenGuard-Key`, body too large — do **not**
-produce a usage log; there is no "request" to record usage for.
+missing/invalid/revoked `X-TokenGuard-Key`, body too large, blocked by
+loop detection (see **Agent loop detection** above) — do **not** produce
+a usage log; there is no "request" to record usage for.
 
 ### Not yet supported
 
@@ -242,18 +314,23 @@ The server starts on `http://localhost:3000` by default.
 
 ## Environment setup
 
-Configuration is centralized in `src/config/env.ts` and loaded from `.env`
-via `dotenv`. See `.env.example` for the currently supported variables:
-`PORT`, `HOST`, `NODE_ENV`; the Supabase settings (`SUPABASE_URL`,
-`SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`); and the proxy settings
-(`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `PROVIDER_REQUEST_TIMEOUT_MS`,
-`MAX_PROXY_BODY_BYTES`). Without real Supabase values, the server falls
-back to local-development placeholders that cannot authenticate against a
-real project; in production, all three Supabase variables are required.
-`SUPABASE_SERVICE_ROLE_KEY` bypasses Row Level Security and must never
-reach a browser or be logged — see **Database** above. There is
-deliberately no `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` variable: provider
-credentials always come from the request, never from server config.
+Configuration is centralized in `src/config/env.ts` (loop-detection
+variables specifically in `src/modules/loop-detection/configuration.ts`)
+and loaded from `.env` via `dotenv`. See `.env.example` for the currently
+supported variables: `PORT`, `HOST`, `NODE_ENV`; the Supabase settings
+(`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`); the
+proxy/streaming settings (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`,
+`PROVIDER_REQUEST_TIMEOUT_MS`, `STREAM_MAX_DURATION_MS`,
+`MAX_PROXY_BODY_BYTES`); and the loop-detection settings
+(`AGENT_LOOP_WINDOW_MS`, `AGENT_LOOP_THRESHOLD`,
+`AGENT_LOOP_BLOCK_DURATION_MS`, `AGENT_LOOP_MAX_ENTRIES`). Without real
+Supabase values, the server falls back to local-development placeholders
+that cannot authenticate against a real project; in production, all
+three Supabase variables are required. `SUPABASE_SERVICE_ROLE_KEY`
+bypasses Row Level Security and must never reach a browser or be logged
+— see **Database** above. There is deliberately no
+`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` variable: provider credentials
+always come from the request, never from server config.
 
 ## Available commands
 
@@ -317,6 +394,9 @@ The AI proxy — see **AI proxy** above.
 
 ## Not implemented yet
 
-Agent-loop detection, budget enforcement, advanced rate limiting, alerts,
-asynchronous/queued usage persistence (it's synchronous for now), and the
-dashboard are **not implemented**. They will be addressed in later steps.
+Budget enforcement, advanced (distributed/cross-instance) rate limiting,
+alerts, asynchronous/queued usage persistence (it's synchronous for
+now), and the dashboard are **not implemented**. They will be addressed
+in later steps. (Single-instance, in-memory agent loop detection _is_
+implemented — see **Agent loop detection** above; it does not extend
+across multiple TokenGuard instances.)

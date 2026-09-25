@@ -6,15 +6,21 @@ export interface InspectedRequestBody {
   requestedModel: string | null;
   /** Whether the client requested `stream: true`. */
   isStreaming: boolean;
+  /** The parsed JSON body itself, for callers that need to derive
+   * something from it in-memory for this request only (e.g. the loop
+   * detector's signature hash). Never re-forwarded upstream — the
+   * original `rawBody` buffer is what's forwarded — and never persisted
+   * or logged by any caller. */
+  parsedBody: Record<string, unknown>;
 }
 
 /**
  * Extracts what the route needs to decide how to handle a proxy request
- * — the requested model (usage-log fallback) and whether streaming was
- * requested — without touching what actually gets forwarded upstream.
- * This is the only reason the raw body is ever parsed here; the original
- * buffer, not this parsed value, is what gets forwarded, never a
- * re-serialized reconstruction of it.
+ * — the requested model (usage-log fallback), whether streaming was
+ * requested, and the parsed body itself — without touching what actually
+ * gets forwarded upstream. This is the only reason the raw body is ever
+ * parsed here; the original buffer, not this parsed value, is what gets
+ * forwarded, never a re-serialized reconstruction of it.
  */
 export function inspectProxyRequestBody(rawBody: Buffer): InspectedRequestBody {
   let parsed: unknown;
@@ -32,5 +38,6 @@ export function inspectProxyRequestBody(rawBody: Buffer): InspectedRequestBody {
   return {
     requestedModel: typeof body.model === "string" && body.model.length > 0 ? body.model : null,
     isStreaming: body.stream === true,
+    parsedBody: body,
   };
 }
