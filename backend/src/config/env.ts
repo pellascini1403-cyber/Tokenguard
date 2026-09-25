@@ -2,6 +2,8 @@ import "dotenv/config";
 import { parsePositiveInt } from "../lib/env-parsing.js";
 import { parseLoopDetectionConfig } from "../modules/loop-detection/configuration.js";
 import type { LoopDetectionConfig } from "../modules/loop-detection/types.js";
+import { parseUsageLoggingConfig } from "../modules/usage-logging/configuration.js";
+import type { UsageLoggingConfig } from "../modules/usage-logging/types.js";
 
 export type NodeEnv = "development" | "test" | "production";
 
@@ -43,6 +45,7 @@ export interface EnvConfig {
   supabase: SupabaseEnvConfig;
   proxy: ProxyEnvConfig;
   loopDetection: LoopDetectionConfig;
+  usageLogging: UsageLoggingConfig;
 }
 
 function parseNodeEnv(value: string | undefined): NodeEnv {
@@ -149,5 +152,6 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): EnvConfig {
     supabase: parseSupabaseConfig(source, nodeEnv),
     proxy: parseProxyConfig(source),
     loopDetection: parseLoopDetectionConfig(source),
+    usageLogging: parseUsageLoggingConfig(source),
   };
 }

@@ -357,20 +357,13 @@ export function createFakeAdminClient(seed?: Partial<FakeStore>): {
         );
         let applied = false;
         if (!alreadyCharged) {
-          // Mirrors the real migration's FK + trigger: a charge can only
-          // be recorded for a request_id that already has a token_logs
-          // row, owned by the same organization.
+          // Mirrors the Step 9 migration: a charge no longer requires a
+          // token_logs row to exist first (budget accounting now runs
+          // before — and independently of — the async usage-log write),
+          // but if one already happens to exist, its organization must
+          // still match (defense in depth, unchanged from Step 8).
           const logRow = store.token_logs.find((t) => t.request_id === requestId);
-          if (!logRow) {
-            return Promise.resolve({
-              data: null,
-              error: {
-                message: `request_id ${JSON.stringify(requestId)} does not have a corresponding token_logs row`,
-                code: "P0001",
-              },
-            });
-          }
-          if (logRow.organization_id !== orgId) {
+          if (logRow && logRow.organization_id !== orgId) {
             return Promise.resolve({
               data: null,
               error: {

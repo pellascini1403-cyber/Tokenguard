@@ -14,9 +14,11 @@ function buildStore(budgetUsd: string, extra: Partial<FakeStore> = {}) {
   });
 }
 
-/** A budget charge is only valid once a corresponding token_logs row
- * exists (mirrors the real FK/trigger) — this seeds one directly,
- * without going through the full proxy/usage-recorder flow. */
+/** As of Step 9, a budget charge no longer requires a token_logs row to
+ * exist first (see the migration decoupling the FK) — this helper seeds
+ * one anyway for tests that specifically want to exercise the
+ * defense-in-depth organization-match check, which still applies when a
+ * matching row happens to already be present. */
 function seedTokenLog(store: FakeStore, requestId: string, organizationId = ORG_ID) {
   store.token_logs.push({
     id: randomUUID(),

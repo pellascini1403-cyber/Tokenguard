@@ -20,6 +20,8 @@ import { createOpenAiAdapter } from "./modules/providers/openai.adapter.js";
 import { createPricingService } from "./modules/pricing/pricing.service.js";
 import type { ModelPricing } from "./modules/pricing/types.js";
 import { createUsageRecorder } from "./modules/proxy/usage-recorder.js";
+import { createUsageLoggingService } from "./modules/usage-logging/usage-logging.service.js";
+import type { UsageLoggingConfig } from "./modules/usage-logging/types.js";
 import { createUsageService } from "./modules/usage/usage.service.js";
 import { registerHealthRoute } from "./routes/health.route.js";
 import { registerV1Routes } from "./routes/v1/index.js";
@@ -40,6 +42,12 @@ export interface BuildAppOptions {
    * (and its in-memory state) is created per buildApp() call and shared
    * by both proxy routes — see modules/loop-detection. */
   loopDetection?: LoopDetectionConfig;
+  /** Inject usage-logging queue/worker tunables (e.g. a tiny queue size
+   * or fast retry timing for deterministic tests). Defaults to env. One
+   * queue/worker instance is created per buildApp() call, decorated on
+   * the returned instance as `app.usageLoggingService`, and drained
+   * gracefully when `app.close()` runs — see modules/usage-logging. */
+  usageLogging?: UsageLoggingConfig;
 }
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
@@ -70,6 +78,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const supabase = options.supabase ?? createSupabaseClients(getEnv());
   const proxyEnv = options.proxy ?? getEnv().proxy;
   const loopDetectionConfig = options.loopDetection ?? getEnv().loopDetection;
+  const usageLoggingConfig = options.usageLogging ?? getEnv().usageLogging;
 
   const requireAuth = createRequireAuthHook(supabase.authClient);
   const organizationsService = createOrganizationsService(supabase.adminClient);
@@ -78,8 +87,18 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const usageService = createUsageService(supabase.adminClient);
   const pricingService = createPricingService(options.pricingTable);
   const budgetService = createBudgetService(supabase.adminClient);
-  const usageRecorder = createUsageRecorder(usageService, pricingService, budgetService);
+  const usageLoggingService = createUsageLoggingService(usageService, usageLoggingConfig, app.log);
+  const usageRecorder = createUsageRecorder(usageLoggingService, pricingService, budgetService);
   const loopDetector = createLoopDetector(loopDetectionConfig);
+
+  app.decorate("usageLoggingService", usageLoggingService);
+  // Graceful shutdown (Step 9): stop accepting new usage-log events,
+  // let in-flight/queued ones drain up to the configured timeout, then
+  // let normal server shutdown continue. Runs for both a real SIGTERM/
+  // SIGINT (see server.ts) and every test's `app.close()`.
+  app.addHook("onClose", async () => {
+    await usageLoggingService.shutdown();
+  });
 
   registerHealthRoute(app);
   registerV1Routes(app, {

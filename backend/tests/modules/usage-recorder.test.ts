@@ -5,7 +5,7 @@ import {
   createBudgetService,
   type BudgetService,
 } from "../../src/modules/budget/budget.service.js";
-import { createUsageService } from "../../src/modules/usage/usage.service.js";
+import { createUsageService, type UsageService } from "../../src/modules/usage/usage.service.js";
 import { createPricingService } from "../../src/modules/pricing/pricing.service.js";
 import type { ModelPricing } from "../../src/modules/pricing/types.js";
 import {
@@ -16,6 +16,11 @@ import {
 } from "../../src/modules/proxy/usage-recorder.js";
 import type { ProxyRequestContext } from "../../src/modules/proxy/types.js";
 import type { ParsedProviderResponse } from "../../src/modules/providers/usage-types.js";
+import { createUsageLoggingService } from "../../src/modules/usage-logging/usage-logging.service.js";
+import type {
+  UsageLoggingConfig,
+  UsageLoggingService,
+} from "../../src/modules/usage-logging/types.js";
 import { createFakeAdminClient, type FakeStore } from "../helpers/fake-admin-client.js";
 
 const ORG_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -34,6 +39,17 @@ const PRICING_TABLE: ModelPricing[] = [
   },
 ];
 
+// Fast, small settings — these tests care about correctness, not real
+// backoff timing.
+const TEST_USAGE_LOGGING_CONFIG: UsageLoggingConfig = {
+  maxQueueSize: 100,
+  workerConcurrency: 2,
+  maxRetryAttempts: 3,
+  retryBaseDelayMs: 1,
+  retryMaxDelayMs: 5,
+  shutdownTimeoutMs: 1_000,
+};
+
 function buildContext(overrides: Partial<ProxyRequestContext> = {}): ProxyRequestContext {
   return {
     requestId: randomUUID(),
@@ -47,7 +63,23 @@ function buildContext(overrides: Partial<ProxyRequestContext> = {}): ProxyReques
   };
 }
 
-function buildSetup() {
+function silentLogger(): FastifyBaseLogger {
+  return {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  } as unknown as FastifyBaseLogger;
+}
+
+function buildUsageLogging(usageService: UsageService): UsageLoggingService {
+  return createUsageLoggingService(usageService, TEST_USAGE_LOGGING_CONFIG, silentLogger());
+}
+
+function buildSetup(): {
+  store: FakeStore;
+  recorder: ReturnType<typeof createUsageRecorder>;
+  usageLogging: UsageLoggingService;
+} {
   const { client, store } = createFakeAdminClient({
     organizations: [{ id: ORG_ID, name: "Org A", monthly_budget_usd: "500.00" }],
     token_guard_keys: [
@@ -61,10 +93,10 @@ function buildSetup() {
       },
     ],
   });
-  const usageService = createUsageService(client);
+  const usageLogging = buildUsageLogging(createUsageService(client));
   const pricingService = createPricingService(PRICING_TABLE);
-  const recorder = createUsageRecorder(usageService, pricingService);
-  return { store, recorder };
+  const recorder = createUsageRecorder(usageLogging, pricingService);
+  return { store, recorder, usageLogging };
 }
 
 function buildInput(
@@ -81,11 +113,59 @@ function buildInput(
   };
 }
 
-describe("usage recorder", () => {
-  it("persists a token_logs row with normalized usage and calculated cost", async () => {
-    const { store, recorder } = buildSetup();
+describe("usage recorder — async usage-log persistence (Step 9)", () => {
+  it("resolves without ever awaiting persistence — proven with a createUsageLog that never resolves", async () => {
+    // The conclusive proof that recordProxyUsage does not await
+    // persistence: if it did, this test would hang until Vitest's
+    // default test timeout, since createUsageLog here never resolves.
+    // A weaker "check store.token_logs right after" assertion can't
+    // distinguish "genuinely async" from "happened to finish first" —
+    // this can only pass if the enqueue is truly fire-and-forget.
+    const neverResolves = new Promise<never>(() => {
+      // Deliberately never settles.
+    });
+    const hangingUsageService: UsageService = {
+      createUsageLog: vi.fn().mockReturnValue(neverResolves),
+      getOrganizationLogs: vi.fn(),
+      getOrganizationUsageSummary: vi.fn(),
+    };
+    const usageLogging = buildUsageLogging(hangingUsageService);
+    const recorder = createUsageRecorder(usageLogging, createPricingService(PRICING_TABLE));
 
-    const log = await recorder.recordProxyUsage(
+    await expect(
+      recorder.recordProxyUsage(
+        buildInput(
+          {},
+          {
+            model: "gpt-priced",
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, source: "provider" },
+          },
+        ),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("returns before the usage log is actually persisted, observable via waitForIdle()", async () => {
+    const { store, recorder, usageLogging } = buildSetup();
+
+    await recorder.recordProxyUsage(
+      buildInput(
+        {},
+        {
+          model: "gpt-priced",
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, source: "provider" },
+        },
+      ),
+    );
+
+    await usageLogging.waitForIdle();
+    expect(store.token_logs).toHaveLength(1);
+  });
+
+  it("persists a token_logs row with normalized usage and calculated cost once drained", async () => {
+    const { store, recorder, usageLogging } = buildSetup();
+
+    await recorder.recordProxyUsage(
       buildInput(
         {},
         {
@@ -99,19 +179,21 @@ describe("usage recorder", () => {
         },
       ),
     );
+    await usageLogging.waitForIdle();
 
-    expect(log.inputCostUsd).toBe("2.00000000");
-    expect(log.outputCostUsd).toBe("8.00000000");
-    expect(log.totalCostUsd).toBe("10.00000000");
-    expect(log.usageSource).toBe("provider");
-    expect(log.pricingVersion).toBe("test-v1");
     expect(store.token_logs).toHaveLength(1);
+    const log = store.token_logs[0];
+    expect(log?.input_cost_usd).toBe("2.00000000");
+    expect(log?.output_cost_usd).toBe("8.00000000");
+    expect(log?.total_cost_usd).toBe("10.00000000");
+    expect(log?.usage_source).toBe("provider");
+    expect(log?.pricing_version).toBe("test-v1");
   });
 
   it("persists null costs (never 0) for an unpriced model, and still succeeds", async () => {
-    const { store, recorder } = buildSetup();
+    const { store, recorder, usageLogging } = buildSetup();
 
-    const log = await recorder.recordProxyUsage(
+    await recorder.recordProxyUsage(
       buildInput(
         { requestedModel: "gpt-unknown-model" },
         {
@@ -120,19 +202,20 @@ describe("usage recorder", () => {
         },
       ),
     );
+    await usageLogging.waitForIdle();
 
-    expect(log.promptTokens).toBe(100);
-    expect(log.inputCostUsd).toBeNull();
-    expect(log.outputCostUsd).toBeNull();
-    expect(log.totalCostUsd).toBeNull();
-    expect(log.pricingVersion).toBeNull();
-    expect(store.token_logs).toHaveLength(1);
+    const log = store.token_logs[0];
+    expect(log?.prompt_tokens).toBe(100);
+    expect(log?.input_cost_usd).toBeNull();
+    expect(log?.output_cost_usd).toBeNull();
+    expect(log?.total_cost_usd).toBeNull();
+    expect(log?.pricing_version).toBeNull();
   });
 
   it("persists null usage fields (never 0) when the response reported none", async () => {
-    const { recorder } = buildSetup();
+    const { store, recorder, usageLogging } = buildSetup();
 
-    const log = await recorder.recordProxyUsage(
+    await recorder.recordProxyUsage(
       buildInput(
         {},
         {
@@ -141,17 +224,19 @@ describe("usage recorder", () => {
         },
       ),
     );
+    await usageLogging.waitForIdle();
 
-    expect(log.promptTokens).toBeNull();
-    expect(log.completionTokens).toBeNull();
-    expect(log.totalTokens).toBeNull();
-    expect(log.usageSource).toBe("unknown");
+    const log = store.token_logs[0];
+    expect(log?.prompt_tokens).toBeNull();
+    expect(log?.completion_tokens).toBeNull();
+    expect(log?.total_tokens).toBeNull();
+    expect(log?.usage_source).toBe("unknown");
   });
 
   it("falls back to the requested model when the response omits one", async () => {
-    const { recorder } = buildSetup();
+    const { store, recorder, usageLogging } = buildSetup();
 
-    const log = await recorder.recordProxyUsage(
+    await recorder.recordProxyUsage(
       buildInput(
         { requestedModel: "gpt-priced" },
         {
@@ -160,15 +245,16 @@ describe("usage recorder", () => {
         },
       ),
     );
+    await usageLogging.waitForIdle();
 
-    expect(log.modelUsed).toBe("gpt-priced");
+    expect(store.token_logs[0]?.model_used).toBe("gpt-priced");
   });
 
   it("persists the exact request id from the proxy context", async () => {
-    const { recorder } = buildSetup();
+    const { store, recorder, usageLogging } = buildSetup();
     const requestId = randomUUID();
 
-    const log = await recorder.recordProxyUsage(
+    await recorder.recordProxyUsage(
       buildInput(
         { requestId },
         {
@@ -177,14 +263,15 @@ describe("usage recorder", () => {
         },
       ),
     );
+    await usageLogging.waitForIdle();
 
-    expect(log.requestId).toBe(requestId);
+    expect(store.token_logs[0]?.request_id).toBe(requestId);
   });
 
   it("persists a non-negative duration and the upstream status code", async () => {
-    const { recorder } = buildSetup();
+    const { store, recorder, usageLogging } = buildSetup();
 
-    const log = await recorder.recordProxyUsage(
+    await recorder.recordProxyUsage(
       buildInput(
         {},
         {
@@ -194,10 +281,11 @@ describe("usage recorder", () => {
         { statusCode: 429, durationMs: 17 },
       ),
     );
+    await usageLogging.waitForIdle();
 
-    expect(log.statusCode).toBe(429);
-    expect(log.durationMs).toBe(17);
-    expect(log.durationMs).toBeGreaterThanOrEqual(0);
+    const log = store.token_logs[0];
+    expect(log?.status_code).toBe(429);
+    expect(log?.duration_ms).toBe(17);
   });
 
   it("keeps organization A's usage isolated from organization B", async () => {
@@ -227,10 +315,8 @@ describe("usage recorder", () => {
         },
       ],
     });
-    const recorder = createUsageRecorder(
-      createUsageService(client),
-      createPricingService(PRICING_TABLE),
-    );
+    const usageLogging = buildUsageLogging(createUsageService(client));
+    const recorder = createUsageRecorder(usageLogging, createPricingService(PRICING_TABLE));
 
     await recorder.recordProxyUsage(
       buildInput(
@@ -250,12 +336,38 @@ describe("usage recorder", () => {
         },
       ),
     );
+    await usageLogging.waitForIdle();
 
     expect(store.token_logs).toHaveLength(2);
     const orgIds = store.token_logs.map((row) => row.organization_id);
     expect(orgIds).toContain(ORG_ID);
     expect(orgIds).toContain(orgB);
     expect(new Set(orgIds).size).toBe(2);
+  });
+
+  it("is idempotent: processing the same request twice never creates a duplicate token_logs row", async () => {
+    const { store, recorder, usageLogging } = buildSetup();
+    const requestId = randomUUID();
+    const input = buildInput(
+      { requestId },
+      {
+        model: "gpt-priced",
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, source: "provider" },
+      },
+    );
+
+    await recorder.recordProxyUsage(input);
+    await usageLogging.waitForIdle();
+    expect(store.token_logs).toHaveLength(1);
+
+    // A process-level duplicate enqueue for the exact same request (e.g.
+    // a retried route handler) — the queue/worker must not create a
+    // second row; the existing request_id unique index is what makes
+    // this safe (see usage-logging.service.ts's classifyUsageLogError).
+    await recorder.recordProxyUsage(input);
+    await usageLogging.waitForIdle();
+
+    expect(store.token_logs).toHaveLength(1);
   });
 });
 
@@ -330,11 +442,12 @@ describe("recordProxyUsageSafely", () => {
   });
 });
 
-describe("usage recorder — Step 8 budget accounting (Phase B)", () => {
+describe("usage recorder — Step 8 budget accounting stays synchronous (Phase B)", () => {
   function buildSetupWithBudget(): {
     store: FakeStore;
     recorder: ReturnType<typeof createUsageRecorder>;
     budgetService: BudgetService;
+    usageLogging: UsageLoggingService;
   } {
     const { client, store } = createFakeAdminClient({
       organizations: [{ id: ORG_ID, name: "Org A", monthly_budget_usd: "500.00" }],
@@ -349,18 +462,18 @@ describe("usage recorder — Step 8 budget accounting (Phase B)", () => {
         },
       ],
     });
-    const usageService = createUsageService(client);
+    const usageLogging = buildUsageLogging(createUsageService(client));
     const pricingService = createPricingService(PRICING_TABLE);
     const budgetService = createBudgetService(client);
-    const recorder = createUsageRecorder(usageService, pricingService, budgetService);
-    return { store, recorder, budgetService };
+    const recorder = createUsageRecorder(usageLogging, pricingService, budgetService);
+    return { store, recorder, budgetService, usageLogging };
   }
 
   function fakeLogger(): FastifyBaseLogger {
     return { error: vi.fn(), warn: vi.fn() } as unknown as FastifyBaseLogger;
   }
 
-  it("commits the known cost against the organization's budget period", async () => {
+  it("commits the known cost against the budget period BEFORE recordProxyUsage returns — no wait needed", async () => {
     const { store, recorder } = buildSetupWithBudget();
     const requestId = randomUUID();
 
@@ -379,6 +492,9 @@ describe("usage recorder — Step 8 budget accounting (Phase B)", () => {
       ),
     );
 
+    // Checked immediately, with no waitForIdle() call — proving the
+    // budget charge is synchronous/critical, unlike the (queued)
+    // token_logs write.
     expect(store.organization_budget_charges).toHaveLength(1);
     const charge = store.organization_budget_charges[0];
     expect(charge?.request_id).toBe(requestId);
@@ -433,28 +549,9 @@ describe("usage recorder — Step 8 budget accounting (Phase B)", () => {
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
-  it("is idempotent: calling recordProxyUsage's underlying charge twice for the same request_id never double-charges", async () => {
+  it("is idempotent: calling commitCharge twice for the same request_id never double-charges", async () => {
     const { store, budgetService } = buildSetupWithBudget();
     const requestId = randomUUID();
-    store.token_logs.push({
-      id: randomUUID(),
-      organization_id: ORG_ID,
-      token_guard_key_id: KEY_ID,
-      provider: "openai",
-      model_used: "gpt-priced",
-      prompt_tokens: 1,
-      completion_tokens: 1,
-      total_tokens: 2,
-      input_cost_usd: "5.00000000",
-      output_cost_usd: "5.00000000",
-      total_cost_usd: "10.00000000",
-      usage_source: "provider",
-      pricing_version: "test-v1",
-      duration_ms: 1,
-      status_code: 200,
-      request_id: requestId,
-      created_at: new Date().toISOString(),
-    });
 
     await budgetService.commitCharge({
       organizationId: ORG_ID,
@@ -475,7 +572,23 @@ describe("usage recorder — Step 8 budget accounting (Phase B)", () => {
     expect(period?.committed_cost_usd).toBe("10.00000000");
   });
 
-  it("throws BudgetAccountingFailedError when the budget commit fails, without discarding the already-persisted usage log", async () => {
+  it("commits a budget charge even with no token_logs row yet — Step 9 decoupled the ordering", async () => {
+    const { store, budgetService } = buildSetupWithBudget();
+    const requestId = randomUUID();
+    expect(store.token_logs).toHaveLength(0);
+
+    const result = await budgetService.commitCharge({
+      organizationId: ORG_ID,
+      requestId,
+      periodStart: "2026-09-01",
+      amountUsd: "5.00000000",
+    });
+
+    expect(result.applied).toBe(true);
+    expect(store.token_logs).toHaveLength(0);
+  });
+
+  it("throws BudgetAccountingFailedError when the budget commit fails, but still enqueues the usage log", async () => {
     const { client, store } = createFakeAdminClient({
       organizations: [{ id: ORG_ID, name: "Org A", monthly_budget_usd: "500.00" }],
       token_guard_keys: [
@@ -489,13 +602,13 @@ describe("usage recorder — Step 8 budget accounting (Phase B)", () => {
         },
       ],
     });
-    const usageService = createUsageService(client);
+    const usageLogging = buildUsageLogging(createUsageService(client));
     const pricingService = createPricingService(PRICING_TABLE);
     const failingBudgetService: BudgetService = {
       checkAdmission: vi.fn(),
       commitCharge: vi.fn().mockRejectedValue(new Error("connection reset")),
     };
-    const recorder = createUsageRecorder(usageService, pricingService, failingBudgetService);
+    const recorder = createUsageRecorder(usageLogging, pricingService, failingBudgetService);
     const requestId = randomUUID();
 
     await expect(
@@ -510,9 +623,9 @@ describe("usage recorder — Step 8 budget accounting (Phase B)", () => {
       ),
     ).rejects.toBeInstanceOf(BudgetAccountingFailedError);
 
-    // The usage log itself was already persisted before the budget
-    // commit was attempted — a budget-accounting failure never rolls
-    // that back or hides it.
+    // The usage-log enqueue is independent of the budget-accounting
+    // outcome above — a budget failure never suppresses the audit trail.
+    await usageLogging.waitForIdle();
     expect(store.token_logs).toHaveLength(1);
     expect(store.token_logs[0]?.request_id).toBe(requestId);
   });
@@ -546,5 +659,63 @@ describe("usage recorder — Step 8 budget accounting (Phase B)", () => {
     expect(payload.requestId).toBe(requestId);
     expect(message).toContain("CRITICAL");
     expect(message).toContain("budget accounting failed");
+  });
+});
+
+describe("usage recorder — never stores anything resembling raw request/response content", () => {
+  it("the enqueued event and resulting row contain only accounting metadata", async () => {
+    const promptMarker = "MARKER-PROMPT-SHOULD-NEVER-APPEAR";
+    const { store, recorder, usageLogging } = buildSetup();
+
+    await recorder.recordProxyUsage(
+      buildInput(
+        {},
+        {
+          model: "gpt-priced",
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, source: "provider" },
+        },
+      ),
+    );
+    await usageLogging.waitForIdle();
+
+    const serialized = JSON.stringify(store.token_logs[0]);
+    expect(serialized).not.toContain(promptMarker);
+    expect(serialized).not.toContain("Bearer ");
+    expect(serialized).not.toContain("Authorization");
+    const row = store.token_logs[0];
+    expect(row).not.toHaveProperty("prompt");
+    expect(row).not.toHaveProperty("response");
+    expect(row).not.toHaveProperty("body");
+  });
+});
+
+describe("usage-logging service integration — queue full does not fail the caller", () => {
+  it("enqueue() returns false and logs a high-severity error, without recordProxyUsage throwing", async () => {
+    const { client } = createFakeAdminClient({
+      organizations: [{ id: ORG_ID, name: "Org A", monthly_budget_usd: "500.00" }],
+    });
+    const logger = silentLogger();
+    const tinyConfig: UsageLoggingConfig = { ...TEST_USAGE_LOGGING_CONFIG, maxQueueSize: 0 };
+    const usageLogging = createUsageLoggingService(createUsageService(client), tinyConfig, logger);
+    const recorder = createUsageRecorder(usageLogging, createPricingService(PRICING_TABLE));
+
+    await expect(
+      recorder.recordProxyUsage(
+        buildInput(
+          {},
+          {
+            model: "gpt-priced",
+            usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, source: "provider" },
+          },
+        ),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(logger.error).toHaveBeenCalled();
+    const errorCalls = vi.mocked(logger.error).mock.calls as [Record<string, unknown>, string][];
+    const queueFullCall = errorCalls.find(
+      ([payload]) => payload.errorCode === "USAGE_LOG_QUEUE_FULL",
+    );
+    expect(queueFullCall).toBeDefined();
   });
 });

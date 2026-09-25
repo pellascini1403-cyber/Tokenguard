@@ -23,7 +23,7 @@ This service (`backend/`) is the TokenGuard AI API proxy. Over time it will:
 - asynchronously persist usage logs
 - expose usage data to a Next.js dashboard
 
-## Current scope: Step 8 — monthly budget enforcement
+## Current scope: Step 9 — async usage logging
 
 Step 1 established the Fastify/TypeScript foundation. Step 2 added
 Supabase auth, organizations, and TokenGuard API keys. Step 3 added the
@@ -34,8 +34,11 @@ completed proxy request produce a `token_logs` row with normalized usage
 and a calculated cost. Step 6 added real, live streaming for both
 endpoints. Step 7 added a lightweight anti-loop mechanism that blocks
 rapid repetition of effectively identical requests before they become an
-expensive API-cost problem. Step 8 adds organization-level monthly
+expensive API-cost problem. Step 8 added organization-level monthly
 budget enforcement on top of `organizations.monthly_budget_usd` (Step 2).
+Step 9 moves `token_logs` persistence off the client-facing request path
+and onto a small internal queue/worker, without changing Step 8's budget
+correctness.
 
 - **Usage normalization** (`src/modules/providers/{openai,anthropic}-usage.ts`)
   maps each provider's own response shape to a common
@@ -68,6 +71,11 @@ budget enforcement on top of `organizations.monthly_budget_usd` (Step 2).
   organization's committed spend for the current UTC month has reached
   its `monthly_budget_usd`, and atomically accounts for each request's
   known cost afterward. See **Budget enforcement** below.
+- **Async usage logging** (`src/modules/usage-logging/`) persists the
+  `token_logs` audit row on a small in-process queue/worker instead of
+  the request path — the client response no longer waits on it. Budget
+  accounting (above) stays synchronous; only the audit row moved. See
+  **Async usage logging** below.
 
 ## Pricing
 
@@ -276,13 +284,114 @@ See `supabase/migrations/20260927000000_create_budget_ledger.sql`.
 If the Phase A admission check itself fails (a database error), the
 request is rejected with `503`/`BUDGET_CHECK_UNAVAILABLE` — TokenGuard
 never treats "couldn't verify the budget" as "budget available" (fails
-closed, never open). If Phase B accounting fails _after_ a usage log was
-already persisted, the client-facing response is unaffected (usage was
-genuinely recorded, and the AI response already succeeded), but a
-distinct, high-severity structured log is emitted — never silently
-swallowed — because committed spend is now under-counted, which could
-let a later admission check wrongly allow a request it should have
-blocked. See `BudgetAccountingFailedError` in `usage-recorder.ts`.
+closed, never open). If Phase B accounting itself fails, the
+client-facing response is unaffected (the AI response already
+succeeded), but a distinct, high-severity structured log is emitted —
+never silently swallowed — because committed spend is now
+under-counted, which could let a later admission check wrongly allow a
+request it should have blocked. See `BudgetAccountingFailedError` in
+`usage-recorder.ts`. (As of Step 9, Phase B no longer depends on the
+`token_logs` row existing first — see **Async usage logging** below for
+why, and for how the two are now deliberately independent.)
+
+## Async usage logging
+
+Every proxy request still produces a `token_logs` audit row (Step 3/5) —
+but as of Step 9, writing it is no longer something the client waits
+for. `src/modules/usage-logging/` is a small, bounded, in-process
+queue/worker that `src/modules/proxy/usage-recorder.ts` enqueues onto
+instead of inserting directly.
+
+### Why only this, and not budget accounting too
+
+Step 8 introduced two post-request responsibilities with different
+correctness requirements: the `token_logs` audit row (informational,
+best-effort is acceptable) and the budget charge (enforcement-critical —
+see **Budget enforcement** above). Only the first moved. The budget
+charge still runs synchronously, still atomically, and is still awaited
+before `recordProxyUsage()` returns — deferring it onto the same
+best-effort queue as the audit log would let an organization's committed
+spend silently drift out of sync with what a concurrent request's
+admission check sees, which is exactly the race Step 8 was built to
+prevent. Making this possible required removing the foreign key that
+used to force the budget charge to wait for the `token_logs` row to
+exist first (see `20260928000000_decouple_budget_charge_from_token_logs.sql`)
+— the two writes are now fully independent operations with different
+consistency guarantees, not two steps of one write.
+
+|             | Synchronous / critical                                               | Asynchronous / non-critical                                                                                              |
+| ----------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| What        | Budget charge (Phase B, Step 8)                                      | `token_logs` audit row (Step 3/5)                                                                                        |
+| When        | Awaited before `recordProxyUsage()` returns                          | Enqueued and forgotten                                                                                                   |
+| On failure  | Thrown as `BudgetAccountingFailedError`, logged at CRITICAL severity | Retried, then logged and dropped — never thrown                                                                          |
+| Consistency | Exact, atomic, immediately visible to the next admission check       | Best-effort; can lag, and in the worst case (queue full, or the process exiting before the worker drains) may never land |
+
+### Queue and worker
+
+- **Bounded, FIFO, in-process** (`usage-queue.ts`): a plain array capped
+  at `USAGE_LOG_QUEUE_MAX_SIZE` (default 5,000) — `enqueue()` returns
+  `false` once full rather than growing without limit; it never throws.
+- **Worker** (`usage-worker.ts`): `USAGE_LOG_WORKER_CONCURRENCY` (default 4) concurrent lanes, each blocking on an async signal between items
+  (no busy-polling, no timers when idle). A lane that fails one event
+  classifies the error, retries transient failures with exponential
+  backoff and jitter (up to 5 attempts, capped at a few seconds between
+  tries — not environment-configurable, a stable internal policy), and
+  gives up (logging the failure, never crashing) on a permanent error or
+  once retries are exhausted. One bad event never stops the lane or
+  affects any other queued event.
+- **Idempotency**: reuses `token_logs.request_id`'s existing unique index
+  (Step 3) rather than inventing a second mechanism — a worker retry, or
+  a process-level duplicate enqueue of the exact same request, hits the
+  same `DuplicateRequestIdError` either way and is treated as success,
+  never a duplicate row.
+
+### Queue full
+
+Usage tracking is financially relevant, so a full queue is never a
+silent drop: `enqueue()` returning `false` is logged internally as a
+high-severity `USAGE_LOG_QUEUE_FULL` structured event (request id,
+organization id, provider, model, queue size — never request/response
+content) and the caller is told nothing failed, because nothing
+client-visible did. There is no synchronous fallback write: falling back
+to a blocking insert exactly when the queue is already saturated would
+make an overloaded system worse, not better. If this happens, that one
+request's audit row is lost; budget accounting for it is not affected
+(already committed synchronously, before the enqueue is even attempted).
+
+### Persistence failure and shutdown
+
+A `token_logs` insert that fails is retried (as above) and, if still
+failing, logged and dropped — the client already has its AI response,
+and a lost audit row is never worth turning that into a failure now.
+On `app.close()` (a real `SIGTERM`/`SIGINT`, or a test's own cleanup),
+an `onClose` hook stops accepting new events, lets in-flight ones
+finish, and waits for the queue to drain up to
+`USAGE_LOG_SHUTDOWN_TIMEOUT_MS` (default 5s) before letting shutdown
+continue — if the timeout elapses first, the remaining queued count is
+logged (never the events' contents) and shutdown proceeds anyway, since
+hanging forever is worse than losing a bounded, logged amount of
+best-effort audit data.
+
+### Limitations — read this before assuming more than it provides
+
+This is an **in-process, in-memory queue**, not a durable or distributed
+one. If the process crashes, is killed (`SIGKILL`), or loses power before
+a queued event is persisted, that event is lost — there is no
+write-ahead log or external broker backing it. Running multiple
+TokenGuard instances means each has its own independent queue; there is
+no cross-instance coordination. None of this affects budget enforcement
+correctness (see the table above), only the completeness of the
+`token_logs` audit trail. A future step could replace
+`src/modules/usage-logging/usage-queue.ts` and `usage-worker.ts` with a
+durable external queue (e.g. a Postgres-backed outbox table, or a
+managed queue service) behind the same `UsageLoggingService` interface
+— `usage-recorder.ts` and every proxy route would be unaffected, since
+they only depend on that interface, never on the queue's own internal
+implementation.
+
+Configuration (`.env.example`): `USAGE_LOG_QUEUE_MAX_SIZE` (default
+`5000`), `USAGE_LOG_WORKER_CONCURRENCY` (default `4`),
+`USAGE_LOG_SHUTDOWN_TIMEOUT_MS` (default `5000`).
 
 ## Database
 
@@ -310,9 +419,12 @@ Core tables, created by `supabase/migrations/20260924120000_create_core_schema.s
   `pricing_version`, `duration_ms`, `status_code`, and a unique `request_id`.
   Metadata only — no prompts, responses, or credentials.
 - **`organization_budget_periods`** and **`organization_budget_charges`**
-  (`supabase/migrations/20260927000000_create_budget_ledger.sql`) — the
-  Step 8 budget ledger. See **Budget enforcement** above for the
-  accounting model; both are financial/accounting metadata only.
+  (`supabase/migrations/20260927000000_create_budget_ledger.sql`, with
+  `organization_budget_charges.request_id`'s foreign key to `token_logs`
+  removed in `20260928000000_decouple_budget_charge_from_token_logs.sql`
+  — see **Async usage logging** above for why) — the Step 8 budget
+  ledger. See **Budget enforcement** above for the accounting model;
+  both are financial/accounting metadata only.
 
 Organization creation and owner-membership creation happen atomically
 inside a single Postgres function (`create_organization_with_owner`,
@@ -386,9 +498,12 @@ invents or defaults one on your behalf. The body is forwarded to
 the body for a live SSE response — see **Streaming** above.
 
 Every completed request (the provider actually responded, whether with
-success or its own error status, streaming or not) produces a
+success or its own error status, streaming or not) eventually produces a
 `token_logs` row keyed by the `request_id` returned in
-`X-TokenGuard-Request-Id`. Requests that never reach the provider —
+`X-TokenGuard-Request-Id` — as of Step 9, that row is written
+asynchronously (see **Async usage logging** above) and may not exist
+yet at the instant the client receives its response, though it usually
+lands within milliseconds. Requests that never reach the provider —
 missing/invalid/revoked `X-TokenGuard-Key`, body too large, blocked by
 loop detection (see **Agent loop detection** above), blocked by budget
 enforcement, or rejected because the budget check itself failed (see
@@ -417,22 +532,25 @@ The server starts on `http://localhost:3000` by default.
 ## Environment setup
 
 Configuration is centralized in `src/config/env.ts` (loop-detection
-variables specifically in `src/modules/loop-detection/configuration.ts`)
+variables specifically in `src/modules/loop-detection/configuration.ts`,
+usage-logging variables in `src/modules/usage-logging/configuration.ts`)
 and loaded from `.env` via `dotenv`. See `.env.example` for the currently
 supported variables: `PORT`, `HOST`, `NODE_ENV`; the Supabase settings
 (`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`); the
 proxy/streaming settings (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`,
 `PROVIDER_REQUEST_TIMEOUT_MS`, `STREAM_MAX_DURATION_MS`,
-`MAX_PROXY_BODY_BYTES`); and the loop-detection settings
+`MAX_PROXY_BODY_BYTES`); the loop-detection settings
 (`AGENT_LOOP_WINDOW_MS`, `AGENT_LOOP_THRESHOLD`,
-`AGENT_LOOP_BLOCK_DURATION_MS`, `AGENT_LOOP_MAX_ENTRIES`). Without real
-Supabase values, the server falls back to local-development placeholders
-that cannot authenticate against a real project; in production, all
-three Supabase variables are required. `SUPABASE_SERVICE_ROLE_KEY`
-bypasses Row Level Security and must never reach a browser or be logged
-— see **Database** above. There is deliberately no
-`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` variable: provider credentials
-always come from the request, never from server config.
+`AGENT_LOOP_BLOCK_DURATION_MS`, `AGENT_LOOP_MAX_ENTRIES`); and the
+async-usage-logging settings (`USAGE_LOG_QUEUE_MAX_SIZE`,
+`USAGE_LOG_WORKER_CONCURRENCY`, `USAGE_LOG_SHUTDOWN_TIMEOUT_MS`).
+Without real Supabase values, the server falls back to
+local-development placeholders that cannot authenticate against a real
+project; in production, all three Supabase variables are required.
+`SUPABASE_SERVICE_ROLE_KEY` bypasses Row Level Security and must never
+reach a browser or be logged — see **Database** above. There is
+deliberately no `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` variable: provider
+credentials always come from the request, never from server config.
 
 ## Available commands
 
@@ -497,11 +615,14 @@ The AI proxy — see **AI proxy** above.
 ## Not implemented yet
 
 Advanced (distributed/cross-instance) rate limiting, alerts,
-asynchronous/queued usage persistence (it's synchronous for now),
 budget-edit endpoints/dashboard controls, and the dashboard itself are
 **not implemented**. They will be addressed in later steps.
-(Single-instance, in-memory agent loop detection and monthly budget
+(Single-instance, in-memory agent loop detection, monthly budget
 _enforcement_ — reading and accounting against the existing
-`monthly_budget_usd` — _are_ implemented; see **Agent loop detection**
-and **Budget enforcement** above. Neither extends across multiple
-TokenGuard instances, and there is no endpoint yet to change a budget.)
+`monthly_budget_usd` — and async, in-process usage-log persistence _are_
+implemented; see **Agent loop detection**, **Budget enforcement**, and
+**Async usage logging** above. None of them extend across multiple
+TokenGuard instances — the loop detector and usage-logging queue are
+both process-local, and there is no endpoint yet to change a budget. A
+durable/distributed usage-logging queue is a documented future
+direction, not implemented now.)

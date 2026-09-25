@@ -1,9 +1,8 @@
 import type { FastifyBaseLogger } from "fastify";
 import type { BudgetService } from "../budget/budget.service.js";
+import type { UsageLoggingService } from "../usage-logging/types.js";
 import type { ParsedProviderResponse } from "../providers/usage-types.js";
 import type { PricingService } from "../pricing/types.js";
-import type { UsageLog } from "../usage/types.js";
-import type { UsageService } from "../usage/usage.service.js";
 import type { ProxyRequestContext } from "./types.js";
 
 /**
@@ -23,18 +22,22 @@ export interface RecordProxyUsageInput {
 const FALLBACK_MODEL = "unknown";
 
 /**
- * Thrown by recordProxyUsage specifically when the usage log itself was
- * persisted successfully but the subsequent Step 8 budget charge (Phase
- * B) failed. Distinguished from an ordinary persistence failure because
- * it is strictly more serious: usage was recorded, but the
- * organization's committed spend is now under-counted, which can let a
- * later admission check wrongly allow a request it should have blocked.
- * recordProxyUsageSafely logs this distinctly (and at higher severity)
- * from a generic "failed to record proxy usage".
+ * Thrown by recordProxyUsage specifically when the Step 8 budget charge
+ * (Phase B) failed. This is strictly more serious than an ordinary
+ * failure: the organization's committed spend is now under-counted,
+ * which can let a later admission check wrongly allow a request it
+ * should have blocked. recordProxyUsageSafely logs this distinctly (and
+ * at higher severity) from any other failure.
+ *
+ * Note what this is NOT: a failure to *queue* the usage-log write is
+ * never thrown as an error at all (see usage-logging.service.ts) — it is
+ * logged internally by that service and this function returns
+ * normally. Only budget accounting is critical enough to propagate as a
+ * distinguishable failure.
  */
 export class BudgetAccountingFailedError extends Error {
   constructor(cause: unknown) {
-    super("Budget accounting failed after the usage log was already persisted");
+    super("Budget accounting failed while recording proxy usage");
     this.name = "BudgetAccountingFailedError";
     this.cause = cause;
   }
@@ -42,24 +45,64 @@ export class BudgetAccountingFailedError extends Error {
 
 export interface UsageRecorder {
   /**
-   * Prices the normalized usage, persists one token_logs row via
-   * usageService.createUsageLog() (Step 3), and — when a budget service
-   * was configured and the resulting cost is known — commits that cost
-   * against the organization's monthly budget exactly once (Step 8,
-   * Phase B). Throws on failure (validation, persistence, or budget
-   * accounting); callers on the hot path should use
-   * `recordProxyUsageSafely` instead unless they specifically want the
-   * failure to propagate.
+   * Step 9 split this into two parts with different correctness
+   * requirements, per the module's own architecture note below:
    *
-   * `logger` is optional so existing callers/tests that only care about
-   * the usage log itself are unaffected; passing it enables the
-   * BUDGET_COST_UNKNOWN observability event (see below).
+   *  1. SYNCHRONOUS / CRITICAL — when a budget service is configured and
+   *     the resulting cost is known, commits that cost against the
+   *     organization's monthly budget (Step 8, Phase B) and awaits it.
+   *     This must complete — and be visible to the next admission check
+   *     — before this function returns, or the budget ledger could fall
+   *     behind reality. Throws `BudgetAccountingFailedError` on failure.
+   *  2. ASYNCHRONOUS / NON-CRITICAL — enqueues the token_logs row itself
+   *     onto the usage-logging queue (Step 9) and returns without
+   *     waiting for it to be persisted. A full queue is logged
+   *     internally (see usage-logging.service.ts) and never turns into
+   *     an error here — the provider response this usage describes has
+   *     already succeeded by the time this runs, and a lost audit row is
+   *     never worth failing that response over.
+   *
+   * Throws only for (1); callers on the hot path should use
+   * `recordProxyUsageSafely` instead unless they specifically want a
+   * budget-accounting failure to propagate.
+   *
+   * `logger` is optional so tests that only care about the accounting
+   * outcome are unaffected; passing it enables the BUDGET_COST_UNKNOWN
+   * observability event (below).
    */
-  recordProxyUsage(input: RecordProxyUsageInput, logger?: FastifyBaseLogger): Promise<UsageLog>;
+  recordProxyUsage(input: RecordProxyUsageInput, logger?: FastifyBaseLogger): Promise<void>;
 }
 
+/**
+ * Architecture note (Step 9): usage-log persistence (token_logs) and
+ * budget accounting (organization_budget_periods/_charges) used to be
+ * two steps of one synchronous write, in that order — the budget charge
+ * literally could not happen until the token_logs row existed, because
+ * organization_budget_charges.request_id had a foreign key to it (see
+ * Step 8's migration). That made both writes block the client response.
+ *
+ * Step 9 needed to move token_logs persistence off the client-facing
+ * path, but budget accounting has to stay synchronous: Step 8's
+ * correctness relies on a committed charge being immediately visible to
+ * the very next admission check, and deferring it onto the same
+ * best-effort queue as the audit log would let an organization's budget
+ * silently drift out of sync with reality. So the FK was removed (see
+ * `20260928000000_decouple_budget_charge_from_token_logs.sql`) — the
+ * budget charge no longer depends on token_logs existing at all, and the
+ * two writes are now fully independent:
+ *
+ *   - The budget charge still runs synchronously, still atomically, and
+ *     is still idempotent by request_id (Step 8's guarantees, unchanged).
+ *   - The token_logs write is queued (Step 9) and may complete seconds
+ *     later, out of order relative to the budget charge, or — in the
+ *     worst case (queue saturation, or the process exiting before the
+ *     worker drains) — not at all. That risk is scoped to the audit
+ *     trail only; it can never cause a double charge, a missed charge,
+ *     or cross-tenant leakage, because it never touches the budget
+ *     ledger.
+ */
 export function createUsageRecorder(
-  usageService: UsageService,
+  usageLoggingService: UsageLoggingService,
   pricingService: PricingService,
   budgetService?: BudgetService,
 ): UsageRecorder {
@@ -67,14 +110,62 @@ export function createUsageRecorder(
     async recordProxyUsage(
       input: RecordProxyUsageInput,
       logger?: FastifyBaseLogger,
-    ): Promise<UsageLog> {
+    ): Promise<void> {
       const { context, parsedResponse } = input;
       const modelUsed = parsedResponse.model ?? context.requestedModel ?? FALLBACK_MODEL;
 
       const pricing = pricingService.getModelPricing(context.provider, modelUsed);
       const cost = pricingService.calculateCost(parsedResponse.usage, pricing);
 
-      const usageLog = await usageService.createUsageLog({
+      // Budget accounting (critical) is attempted first, but a failure
+      // here must not suppress the (independent, non-critical) usage-log
+      // enqueue below — the audit trail is exactly what operators would
+      // want to reconcile a budget-accounting incident against, so it's
+      // stashed and re-thrown only after the enqueue has happened.
+      let budgetError: BudgetAccountingFailedError | null = null;
+
+      if (budgetService) {
+        if (cost.totalCostUsd === null) {
+          // Unknown cost is never treated as $0 and never charged — only
+          // reported, as safe metadata, so budget accounting's blind
+          // spot stays observable rather than silent.
+          try {
+            logger?.warn(
+              {
+                requestId: context.requestId,
+                organizationId: context.organizationId,
+                tokenGuardKeyId: context.tokenGuardKeyId,
+                provider: context.provider,
+                model: modelUsed,
+                errorCode: "BUDGET_COST_UNKNOWN",
+              },
+              "Known monetary cost unavailable for this request — not counted toward the monthly budget",
+            );
+          } catch {
+            // Never let a logging failure affect the response.
+          }
+        } else {
+          // Critical path: awaited, and a failure here is not
+          // swallowed — see BudgetAccountingFailedError.
+          try {
+            await budgetService.commitCharge({
+              organizationId: context.organizationId,
+              requestId: context.requestId,
+              periodStart: context.budgetPeriodStart,
+              amountUsd: cost.totalCostUsd,
+            });
+          } catch (error) {
+            budgetError = new BudgetAccountingFailedError(error);
+          }
+        }
+      }
+
+      // Non-critical path: enqueued, never awaited for persistence.
+      // enqueue() itself never throws (see usage-logging.service.ts for
+      // the queue-full case) — the provider response this describes has
+      // already been decided by the time this line runs, and this is
+      // attempted even if budget accounting above failed.
+      usageLoggingService.enqueue({
         organizationId: context.organizationId,
         tokenGuardKeyId: context.tokenGuardKeyId,
         provider: context.provider,
@@ -92,57 +183,21 @@ export function createUsageRecorder(
         requestId: context.requestId,
       });
 
-      if (!budgetService) {
-        return usageLog;
+      if (budgetError) {
+        throw budgetError;
       }
-
-      if (cost.totalCostUsd === null) {
-        // Unknown cost is never treated as $0 and never charged — only
-        // reported, as safe metadata, so budget accounting's blind spot
-        // stays observable rather than silent.
-        try {
-          logger?.warn(
-            {
-              requestId: context.requestId,
-              organizationId: context.organizationId,
-              tokenGuardKeyId: context.tokenGuardKeyId,
-              provider: context.provider,
-              model: modelUsed,
-              errorCode: "BUDGET_COST_UNKNOWN",
-            },
-            "Known monetary cost unavailable for this request — not counted toward the monthly budget",
-          );
-        } catch {
-          // Never let a logging failure affect the response.
-        }
-        return usageLog;
-      }
-
-      try {
-        await budgetService.commitCharge({
-          organizationId: context.organizationId,
-          requestId: context.requestId,
-          periodStart: context.budgetPeriodStart,
-          amountUsd: cost.totalCostUsd,
-        });
-      } catch (error) {
-        throw new BudgetAccountingFailedError(error);
-      }
-
-      return usageLog;
     },
   };
 }
 
 /**
- * Records usage without ever throwing. A pricing, persistence, or
- * budget-accounting failure must never turn a successful AI response
- * into a failed one — but per usageService's own contract, failures are
- * never silently discarded either: this logs the failure so it stays
- * visible to operators. A BudgetAccountingFailedError is logged at
- * higher severity and with a distinct message from any other failure,
- * since it means committed spend is now under-counted (see
- * BudgetAccountingFailedError's doc comment above).
+ * Records usage without ever throwing. Budget accounting is the only
+ * failure mode that can still propagate out of `recordProxyUsage`
+ * (usage-log persistence failures happen later, inside the async worker,
+ * and are handled there) — but per that function's own contract,
+ * failures are never silently discarded either: this logs them so they
+ * stay visible to operators, at distinctly higher severity for a
+ * BudgetAccountingFailedError than for anything else.
  */
 export async function recordProxyUsageSafely(
   recorder: UsageRecorder,
@@ -160,7 +215,7 @@ export async function recordProxyUsageSafely(
           organizationId: input.context.organizationId,
           provider: input.context.provider,
         },
-        "CRITICAL: budget accounting failed after usage was recorded — organization spend may be under-counted",
+        "CRITICAL: budget accounting failed — organization spend may be under-counted",
       );
       return;
     }
