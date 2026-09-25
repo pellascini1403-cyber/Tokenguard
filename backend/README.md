@@ -612,11 +612,24 @@ Revokes the key; a revoked key fails verification from then on.
 
 The AI proxy — see **AI proxy** above.
 
+## Frontend dashboard
+
+A Next.js dashboard now exists at `../frontend` (sibling to this
+directory) — see `frontend/README.md` for its architecture. It is an
+**architectural foundation only** (routing, auth, data-fetching, API
+client), not a finished dashboard: most of its pages are honest
+placeholders because this backend does not yet expose the HTTP routes
+they'd need (usage reads, request-log reads, budget-spend reads, key
+listing, member listing — see `frontend/README.md`'s "Missing backend
+capabilities" table for the full list). Read that table before adding
+those routes, so their shape matches what the frontend already expects.
+
 ## Not implemented yet
 
 Advanced (distributed/cross-instance) rate limiting, alerts,
-budget-edit endpoints/dashboard controls, and the dashboard itself are
-**not implemented**. They will be addressed in later steps.
+budget-edit endpoints/dashboard controls, usage/request-log read
+endpoints, and CORS configuration are **not implemented**. They will be
+addressed in later steps.
 (Single-instance, in-memory agent loop detection, monthly budget
 _enforcement_ — reading and accounting against the existing
 `monthly_budget_usd` — and async, in-process usage-log persistence _are_
