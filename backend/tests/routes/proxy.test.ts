@@ -11,6 +11,10 @@ import {
 } from "../helpers/fake-upstream-server.js";
 
 const ORG_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+// Effectively unlimited: this file is about proxying/auth/timeouts, not
+// budget enforcement (see proxy-budget.test.ts) — a huge budget keeps
+// every request here well under it.
+const UNLIMITED_BUDGET_USD = "999999999.00";
 
 function parseBody(res: LightMyRequestResponse): unknown {
   return res.json();
@@ -29,7 +33,11 @@ async function buildTestApp(
   options: TestAppOptions = {},
 ): Promise<{ app: FastifyInstance; tokenGuardKey: string }> {
   const authClient = createFakeAuthClient({});
-  const { client: adminClient } = createFakeAdminClient();
+  const { client: adminClient } = createFakeAdminClient({
+    organizations: [
+      { id: ORG_ID, name: "Proxy test org", monthly_budget_usd: UNLIMITED_BUDGET_USD },
+    ],
+  });
   const keysService = createKeysService(adminClient);
   const created = await keysService.createKey(ORG_ID, "proxy test key");
 

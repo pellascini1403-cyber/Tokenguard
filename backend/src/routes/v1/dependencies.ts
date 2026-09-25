@@ -1,4 +1,5 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
+import type { BudgetService } from "../../modules/budget/budget.service.js";
 import type { OrganizationsService } from "../../modules/organizations/organizations.service.js";
 import type { KeysService } from "../../modules/keys/keys.service.js";
 import type { LoopDetector } from "../../modules/loop-detection/loop-detector.js";
@@ -14,6 +15,7 @@ export interface ProxyDependencies {
   maxBodyBytes: number;
   usageRecorder: UsageRecorder;
   loopDetector: LoopDetector;
+  budgetService: BudgetService;
 }
 
 export interface V1RouteDependencies {

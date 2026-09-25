@@ -20,4 +20,9 @@ export interface ProxyRequestContext {
   /** High-resolution start time (performance.now()), used only to
    * compute duration — never persisted or logged directly. */
   startedAt: number;
+  /** UTC calendar-month budget period this request belongs to
+   * ("YYYY-MM-01"), computed once at the start of the request and
+   * reused for both the Phase A admission check and the Phase B final
+   * accounting commit — see modules/budget/budget-period.ts. */
+  budgetPeriodStart: string;
 }

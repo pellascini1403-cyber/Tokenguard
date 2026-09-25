@@ -23,7 +23,7 @@ This service (`backend/`) is the TokenGuard AI API proxy. Over time it will:
 - asynchronously persist usage logs
 - expose usage data to a Next.js dashboard
 
-## Current scope: Step 7 — agent loop detection
+## Current scope: Step 8 — monthly budget enforcement
 
 Step 1 established the Fastify/TypeScript foundation. Step 2 added
 Supabase auth, organizations, and TokenGuard API keys. Step 3 added the
@@ -32,9 +32,10 @@ non-streaming requests to OpenAI and Anthropic (`POST /v1/chat/completions`,
 `POST /v1/messages`) through provider adapters. Step 5 made every
 completed proxy request produce a `token_logs` row with normalized usage
 and a calculated cost. Step 6 added real, live streaming for both
-endpoints. Step 7 adds a lightweight anti-loop mechanism that blocks
+endpoints. Step 7 added a lightweight anti-loop mechanism that blocks
 rapid repetition of effectively identical requests before they become an
-expensive API-cost problem.
+expensive API-cost problem. Step 8 adds organization-level monthly
+budget enforcement on top of `organizations.monthly_budget_usd` (Step 2).
 
 - **Usage normalization** (`src/modules/providers/{openai,anthropic}-usage.ts`)
   maps each provider's own response shape to a common
@@ -62,6 +63,11 @@ expensive API-cost problem.
   `src/modules/proxy/loop-guard.ts`) hashes a privacy-safe signature of
   each request and blocks it with `429` once it repeats too fast, before
   the provider is ever contacted. See **Agent loop detection** below.
+- **Budget enforcement** (`src/modules/budget/`, `src/modules/proxy/budget-guard.ts`)
+  blocks a request with `429` before contacting the provider once an
+  organization's committed spend for the current UTC month has reached
+  its `monthly_budget_usd`, and atomically accounts for each request's
+  known cost afterward. See **Budget enforcement** below.
 
 ## Pricing
 
@@ -188,6 +194,96 @@ Configuration (`.env.example`): `AGENT_LOOP_WINDOW_MS` (default `10000`),
 `AGENT_LOOP_THRESHOLD` (default `5`), `AGENT_LOOP_BLOCK_DURATION_MS`
 (default `30000`), `AGENT_LOOP_MAX_ENTRIES` (default `10000`).
 
+## Budget enforcement
+
+Both proxy endpoints enforce `organizations.monthly_budget_usd` (Step 2)
+as a hard ceiling on known spend for the current **UTC calendar month**
+— 2026-09-01T00:00:00.000Z through 2026-09-30T23:59:59.999Z is one
+period, regardless of server-local timezone. No new configuration, no
+new billing system, and no cron job: a month's spend is simply a fresh,
+empty row the first time it's needed (`src/modules/budget/budget-period.ts`).
+
+### Two phases, because provider cost is only known after the fact
+
+- **Phase A — admission** (`src/modules/proxy/budget-guard.ts`, before
+  any upstream contact): rejects with `429`/`MONTHLY_BUDGET_EXCEEDED` if
+  the organization's already-committed spend for this period is `>=`
+  its budget; otherwise the request proceeds. Works identically for
+  OpenAI and Anthropic and for streaming and non-streaming requests — a
+  streaming request is admitted or rejected _before_ the SSE connection
+  to the provider is opened, never after.
+- **Phase B — final accounting** (inside `src/modules/proxy/usage-recorder.ts`,
+  reusing the exact Step 5 pipeline): once a request completes and its
+  cost is known, that cost is atomically committed against the period.
+  This step **always** commits the real cost, even if doing so pushes
+  committed spend over budget — the request already reached the
+  provider and really did cost that much; the _next_ request is what
+  gets rejected by Phase A.
+
+**This means TokenGuard cannot guarantee provider spend never exceeds
+the configured budget.** Cost is only known after the provider responds,
+so any requests already in flight when a budget is exhausted can still
+complete and push spend past the limit. What Phase B does guarantee is
+that every one of those completions is committed exactly once, and that
+the next request sees the true, up-to-date total — never a stale or
+partially-applied one.
+
+### Known vs. unknown cost
+
+Only usage with a known `token_logs.total_cost_usd` counts toward the
+budget. A response with no pricing entry for its model still
+completes normally (matching Step 5) — its cost stays `null`, is never
+charged as `$0`, and a safe, metadata-only `BUDGET_COST_UNKNOWN` event
+is logged (request id, organization id, key id, provider, model,
+timestamp — never request/response content) so the blind spot is
+observable rather than silent. A provider error response before usage
+is known is never charged either — same rule, same reason.
+
+### Concurrency and idempotency
+
+- **Admission (Phase A)** is a read: two concurrent requests can both
+  read "under budget" and both proceed, if neither's cost has been
+  committed yet — see the guarantee above. This is a deliberate,
+  documented limitation, not a bug.
+- **Accounting (Phase B)** is where TokenGuard _can_ make a hard
+  guarantee: the commit is one atomic SQL statement
+  (`update ... set committed_cost_usd = committed_cost_usd + $amount`,
+  see `commit_budget_charge` in the migration), so Postgres's own
+  row-level locking serializes concurrent commits for the same
+  organization/period — no update is ever lost to a lost-update race,
+  regardless of how many requests commit at once. Application code never
+  reads a value, adds to it in Node, and writes it back.
+- **Idempotency**: a charge is keyed by `request_id` (the same value as
+  `token_logs.request_id`) in a dedicated `organization_budget_charges`
+  table with `request_id` as its primary key. Committing the same
+  request's cost more than once (e.g. a retried accounting call) is a
+  safe no-op after the first — the organization is never double-charged.
+
+### Storage model
+
+`organization_budget_periods` (one row per organization per UTC month,
+primary key `(organization_id, period_start)`) holds the running
+`committed_cost_usd` total — an O(1) lookup on the hot path, no
+historical-row scanning. `organization_budget_charges` is the
+idempotency ledger described above; its `request_id` column references
+`token_logs.request_id`, so a charge can never exist without a
+corresponding usage log. Neither table stores prompts, responses, raw
+request bodies, or any credential — financial/accounting metadata only.
+See `supabase/migrations/20260927000000_create_budget_ledger.sql`.
+
+### Failure behavior
+
+If the Phase A admission check itself fails (a database error), the
+request is rejected with `503`/`BUDGET_CHECK_UNAVAILABLE` — TokenGuard
+never treats "couldn't verify the budget" as "budget available" (fails
+closed, never open). If Phase B accounting fails _after_ a usage log was
+already persisted, the client-facing response is unaffected (usage was
+genuinely recorded, and the AI response already succeeded), but a
+distinct, high-severity structured log is emitted — never silently
+swallowed — because committed spend is now under-counted, which could
+let a later admission check wrongly allow a request it should have
+blocked. See `BudgetAccountingFailedError` in `usage-recorder.ts`.
+
 ## Database
 
 Core tables, created by `supabase/migrations/20260924120000_create_core_schema.sql`:
@@ -213,6 +309,10 @@ Core tables, created by `supabase/migrations/20260924120000_create_core_schema.s
   (`numeric(14,8)`), `usage_source` (`provider` | `estimated` | `unknown`),
   `pricing_version`, `duration_ms`, `status_code`, and a unique `request_id`.
   Metadata only — no prompts, responses, or credentials.
+- **`organization_budget_periods`** and **`organization_budget_charges`**
+  (`supabase/migrations/20260927000000_create_budget_ledger.sql`) — the
+  Step 8 budget ledger. See **Budget enforcement** above for the
+  accounting model; both are financial/accounting metadata only.
 
 Organization creation and owner-membership creation happen atomically
 inside a single Postgres function (`create_organization_with_owner`,
@@ -290,8 +390,10 @@ success or its own error status, streaming or not) produces a
 `token_logs` row keyed by the `request_id` returned in
 `X-TokenGuard-Request-Id`. Requests that never reach the provider —
 missing/invalid/revoked `X-TokenGuard-Key`, body too large, blocked by
-loop detection (see **Agent loop detection** above) — do **not** produce
-a usage log; there is no "request" to record usage for.
+loop detection (see **Agent loop detection** above), blocked by budget
+enforcement, or rejected because the budget check itself failed (see
+**Budget enforcement** above) — do **not** produce a usage log; there is
+no "request" to record usage for.
 
 ### Not yet supported
 
@@ -394,9 +496,12 @@ The AI proxy — see **AI proxy** above.
 
 ## Not implemented yet
 
-Budget enforcement, advanced (distributed/cross-instance) rate limiting,
-alerts, asynchronous/queued usage persistence (it's synchronous for
-now), and the dashboard are **not implemented**. They will be addressed
-in later steps. (Single-instance, in-memory agent loop detection _is_
-implemented — see **Agent loop detection** above; it does not extend
-across multiple TokenGuard instances.)
+Advanced (distributed/cross-instance) rate limiting, alerts,
+asynchronous/queued usage persistence (it's synchronous for now),
+budget-edit endpoints/dashboard controls, and the dashboard itself are
+**not implemented**. They will be addressed in later steps.
+(Single-instance, in-memory agent loop detection and monthly budget
+_enforcement_ — reading and accounting against the existing
+`monthly_budget_usd` — _are_ implemented; see **Agent loop detection**
+and **Budget enforcement** above. Neither extends across multiple
+TokenGuard instances, and there is no endpoint yet to change a budget.)

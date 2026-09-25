@@ -1,12 +1,14 @@
 import { performance } from "node:perf_hooks";
 import type { FastifyInstance } from "fastify";
 import { unauthorizedError } from "../../lib/errors.js";
+import { getBudgetPeriodStart } from "../../modules/budget/budget-period.js";
 import {
   createAnthropicStreamUsageAccumulator,
   parseAnthropicResponse,
 } from "../../modules/providers/anthropic-usage.js";
 import { inspectProxyRequestBody } from "../../modules/providers/request-body.js";
 import { runProviderRequest } from "../../modules/providers/provider-request-runner.js";
+import { enforceBudgetAdmission } from "../../modules/proxy/budget-guard.js";
 import { enforceLoopDetection } from "../../modules/proxy/loop-guard.js";
 import { handleStreamingProxyRequest } from "../../modules/proxy/streaming-proxy.js";
 import { recordProxyUsageSafely } from "../../modules/proxy/usage-recorder.js";
@@ -48,6 +50,7 @@ export function registerMessagesRoute(app: FastifyInstance, deps: V1RouteDepende
         provider: "anthropic",
         requestedModel,
         startedAt,
+        budgetPeriodStart: getBudgetPeriodStart(),
       };
 
       // Loop detection runs before any upstream contact — a blocked
@@ -68,6 +71,27 @@ export function registerMessagesRoute(app: FastifyInstance, deps: V1RouteDepende
         request.log,
       );
       if (loopDecision.blocked) {
+        return;
+      }
+
+      // Budget admission (Phase A, Step 8) also runs before any upstream
+      // contact — a blocked organization never reaches the provider and
+      // never produces a usage log. See modules/proxy/budget-guard.ts.
+      const budgetDecision = await enforceBudgetAdmission(
+        {
+          budgetService: deps.proxy.budgetService,
+          organizationId: context.organizationId,
+          tokenGuardKeyId: context.tokenGuardKeyId,
+          provider: context.provider,
+          endpoint: ENDPOINT,
+          requestedModel,
+          periodStart: context.budgetPeriodStart,
+          requestId: context.requestId,
+        },
+        reply,
+        request.log,
+      );
+      if (budgetDecision.blocked) {
         return;
       }
 

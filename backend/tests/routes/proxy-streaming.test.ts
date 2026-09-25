@@ -14,6 +14,9 @@ import {
 } from "../helpers/fake-upstream-server.js";
 
 const ORG_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+// Effectively unlimited: this file is about streaming behavior, not
+// budget enforcement (see proxy-budget.test.ts).
+const UNLIMITED_BUDGET_USD = "999999999.00";
 
 const TEST_PRICING_TABLE: ModelPricing[] = [
   {
@@ -50,7 +53,11 @@ async function buildTestApp(
   options: TestAppOptions = {},
 ): Promise<{ app: FastifyInstance; tokenGuardKey: string; store: FakeStore }> {
   const authClient = createFakeAuthClient({});
-  const { client: adminClient, store } = createFakeAdminClient();
+  const { client: adminClient, store } = createFakeAdminClient({
+    organizations: [
+      { id: ORG_ID, name: "Streaming test org", monthly_budget_usd: UNLIMITED_BUDGET_USD },
+    ],
+  });
   const keysService = createKeysService(adminClient);
   const created = await keysService.createKey(ORG_ID, "streaming test key");
 

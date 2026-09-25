@@ -13,6 +13,11 @@ import {
 } from "../helpers/fake-upstream-server.js";
 
 const ORG_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+// Effectively unlimited: this file is about usage/cost recording, not
+// budget enforcement (see proxy-budget.test.ts) — a huge budget keeps
+// every request here well under it, so Phase B accounting always
+// succeeds without ever tripping Phase A admission.
+const UNLIMITED_BUDGET_USD = "999999999.00";
 
 const TEST_PRICING_TABLE: ModelPricing[] = [
   {
@@ -48,7 +53,11 @@ async function buildTestApp(
   options: TestAppOptions = {},
 ): Promise<{ app: FastifyInstance; tokenGuardKey: string; store: FakeStore }> {
   const authClient = createFakeAuthClient({});
-  const { client: adminClient, store } = createFakeAdminClient();
+  const { client: adminClient, store } = createFakeAdminClient({
+    organizations: [
+      { id: ORG_ID, name: "Usage test org", monthly_budget_usd: UNLIMITED_BUDGET_USD },
+    ],
+  });
   const keysService = createKeysService(adminClient);
   const created = await keysService.createKey(ORG_ID, "usage test key");
 
@@ -371,10 +380,15 @@ describe("usage tracking — multi-tenant isolation", () => {
     });
 
     const authClient = createFakeAuthClient({});
-    const { client: adminClient, store } = createFakeAdminClient();
-    const keysService = createKeysService(adminClient);
     const orgA = ORG_ID;
     const orgB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const { client: adminClient, store } = createFakeAdminClient({
+      organizations: [
+        { id: orgA, name: "Org A", monthly_budget_usd: UNLIMITED_BUDGET_USD },
+        { id: orgB, name: "Org B", monthly_budget_usd: UNLIMITED_BUDGET_USD },
+      ],
+    });
+    const keysService = createKeysService(adminClient);
     const keyA = await keysService.createKey(orgA, "org A key");
     const keyB = await keysService.createKey(orgB, "org B key");
 

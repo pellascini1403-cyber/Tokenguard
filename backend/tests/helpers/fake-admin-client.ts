@@ -8,6 +8,8 @@ export interface FakeStore {
   organization_members: Row[];
   token_guard_keys: Row[];
   token_logs: Row[];
+  organization_budget_periods: Row[];
+  organization_budget_charges: Row[];
 }
 
 type TableName = keyof FakeStore;
@@ -247,6 +249,8 @@ export function createFakeAdminClient(seed?: Partial<FakeStore>): {
     organization_members: seed?.organization_members ?? [],
     token_guard_keys: seed?.token_guard_keys ?? [],
     token_logs: seed?.token_logs ?? [],
+    organization_budget_periods: seed?.organization_budget_periods ?? [],
+    organization_budget_charges: seed?.organization_budget_charges ?? [],
   };
 
   const client = {
@@ -298,6 +302,98 @@ export function createFakeAdminClient(seed?: Partial<FakeStore>): {
           ).length,
         };
         return Promise.resolve({ data: [summaryRow], error: null });
+      }
+
+      if (fnName === "get_budget_admission_state") {
+        const orgId = args.p_organization_id as string;
+        const periodStart = args.p_period_start as string;
+        const org = store.organizations.find((o) => o.id === orgId);
+        if (!org) {
+          // Mirrors the real SQL function's inner join: no matching
+          // organization means zero rows returned.
+          return Promise.resolve({ data: [], error: null });
+        }
+        const periodRow = store.organization_budget_periods.find(
+          (p) => p.organization_id === orgId && p.period_start === periodStart,
+        );
+        const committed = periodRow ? Number(periodRow.committed_cost_usd) : 0;
+        const budget = Number(org.monthly_budget_usd);
+        const row: Row = {
+          allowed: committed < budget,
+          monthly_budget_usd: String(org.monthly_budget_usd),
+          committed_cost_usd: committed.toFixed(8),
+        };
+        return Promise.resolve({ data: [row], error: null });
+      }
+
+      if (fnName === "commit_budget_charge") {
+        const orgId = args.p_organization_id as string;
+        const requestId = args.p_request_id as string;
+        const periodStart = args.p_period_start as string;
+        const amount = Number(args.p_amount_usd);
+
+        if (!Number.isFinite(amount) || amount < 0) {
+          return Promise.resolve({
+            data: null,
+            error: { message: "amount_usd must be a non-negative number", code: "P0001" },
+          });
+        }
+
+        let periodRow = store.organization_budget_periods.find(
+          (p) => p.organization_id === orgId && p.period_start === periodStart,
+        );
+        if (!periodRow) {
+          periodRow = {
+            organization_id: orgId,
+            period_start: periodStart,
+            committed_cost_usd: "0.00000000",
+            updated_at: new Date().toISOString(),
+          };
+          store.organization_budget_periods.push(periodRow);
+        }
+
+        const alreadyCharged = store.organization_budget_charges.some(
+          (c) => c.request_id === requestId,
+        );
+        let applied = false;
+        if (!alreadyCharged) {
+          // Mirrors the real migration's FK + trigger: a charge can only
+          // be recorded for a request_id that already has a token_logs
+          // row, owned by the same organization.
+          const logRow = store.token_logs.find((t) => t.request_id === requestId);
+          if (!logRow) {
+            return Promise.resolve({
+              data: null,
+              error: {
+                message: `request_id ${JSON.stringify(requestId)} does not have a corresponding token_logs row`,
+                code: "P0001",
+              },
+            });
+          }
+          if (logRow.organization_id !== orgId) {
+            return Promise.resolve({
+              data: null,
+              error: {
+                message: `organization_id does not match the organization owning request_id ${JSON.stringify(requestId)}`,
+                code: "P0001",
+              },
+            });
+          }
+
+          store.organization_budget_charges.push({
+            request_id: requestId,
+            organization_id: orgId,
+            period_start: periodStart,
+            amount_usd: amount.toFixed(8),
+            created_at: new Date().toISOString(),
+          });
+          applied = true;
+          periodRow.committed_cost_usd = (Number(periodRow.committed_cost_usd) + amount).toFixed(8);
+          periodRow.updated_at = new Date().toISOString();
+        }
+
+        const row: Row = { applied, committed_cost_usd: periodRow.committed_cost_usd };
+        return Promise.resolve({ data: [row], error: null });
       }
 
       return Promise.resolve({ data: null, error: { message: `Unknown RPC: ${fnName}` } });

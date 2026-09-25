@@ -9,6 +9,7 @@ import { buildLoggerOptions } from "./lib/logger.js";
 import { resolveRequestId } from "./lib/request-id.js";
 import { createRequireAuthHook } from "./modules/auth/auth.hook.js";
 import { createSupabaseClients, type SupabaseClients } from "./modules/auth/supabase-client.js";
+import { createBudgetService } from "./modules/budget/budget.service.js";
 import { createOrganizationsService } from "./modules/organizations/organizations.service.js";
 import { createKeysService } from "./modules/keys/keys.service.js";
 import { createRequireTokenGuardKeyHook } from "./modules/keys/tokenguard-key.hook.js";
@@ -76,7 +77,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const requireTokenGuardKey = createRequireTokenGuardKeyHook(keysService);
   const usageService = createUsageService(supabase.adminClient);
   const pricingService = createPricingService(options.pricingTable);
-  const usageRecorder = createUsageRecorder(usageService, pricingService);
+  const budgetService = createBudgetService(supabase.adminClient);
+  const usageRecorder = createUsageRecorder(usageService, pricingService, budgetService);
   const loopDetector = createLoopDetector(loopDetectionConfig);
 
   registerHealthRoute(app);
@@ -93,6 +95,7 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       maxBodyBytes: proxyEnv.maxBodyBytes,
       usageRecorder,
       loopDetector,
+      budgetService,
     },
   });
 
