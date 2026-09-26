@@ -1,3 +1,4 @@
+import { AppScreen } from "@/components/dashboard/app-screen";
 import { MissingBackendCapability } from "@/components/ui/missing-backend-capability";
 
 /**
@@ -7,12 +8,11 @@ import { MissingBackendCapability } from "@/components/ui/missing-backend-capabi
  */
 export default function AlertsPage() {
   return (
-    <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-zinc-900">Alerts</h1>
+    <AppScreen header={<h1 className="text-xl font-semibold">Alerts</h1>}>
       <MissingBackendCapability
         title="Alerts are not implemented in the backend yet"
         explanation="There is no alerts table, service, or route in the backend today. This page is a structural placeholder reserving the route for a later step."
       />
-    </div>
+    </AppScreen>
   );
 }

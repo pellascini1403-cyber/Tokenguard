@@ -34,12 +34,12 @@ export function CreateKeyForm({ organizationId }: CreateKeyFormProps) {
       </form>
       <FormError message={state.error} />
       {state.createdKey && (
-        <div role="status" className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm">
-          <p className="font-medium text-amber-900">
+        <div role="status" className="rounded-md bg-black p-3 text-sm">
+          <p className="font-medium text-amber-400">
             Key created — copy this now, it will not be shown again.
           </p>
-          <p className="mt-1 font-mono break-all text-amber-900">{state.createdKey.apiKey}</p>
-          <p className="mt-1 text-amber-800">
+          <p className="mt-1 break-all font-mono text-white">{state.createdKey.apiKey}</p>
+          <p className="mt-1 text-zinc-400">
             id: {state.createdKey.id} · prefix: {state.createdKey.prefix}
           </p>
         </div>

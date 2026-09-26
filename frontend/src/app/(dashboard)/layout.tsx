@@ -5,8 +5,7 @@ import { getMe } from "@/lib/api/me";
 import { listOrganizations } from "@/lib/api/organizations";
 import { getActiveOrganizationId } from "@/lib/organizations/active-organization";
 import { OrganizationProvider } from "@/lib/organizations/context";
-import { Sidebar } from "@/components/dashboard/sidebar";
-import { Header } from "@/components/dashboard/header";
+import { AppNavigation } from "@/components/dashboard/app-navigation";
 
 /**
  * The authenticated app shell. proxy.ts already redirects unauthenticated
@@ -15,6 +14,11 @@ import { Header } from "@/components/dashboard/header";
  * rather than relying on Proxy alone"), every Server Component under
  * this layout that can mutate or read organization-scoped data
  * re-verifies the session itself (see lib/auth/session.ts).
+ *
+ * Visual shell: a fixed bottom tab bar built from 5 provided PNG assets
+ * (see components/dashboard/app-navigation.tsx) replaces the earlier
+ * desktop sidebar — each page supplies its own black-header/white-body
+ * zones via AppScreen.
  */
 export default async function DashboardLayout({ children }: { children: ReactNode }) {
   const session = await requireServerSession();
@@ -30,13 +34,8 @@ export default async function DashboardLayout({ children }: { children: ReactNod
 
   return (
     <OrganizationProvider organizations={organizations} activeOrganizationId={activeOrganizationId}>
-      <div className="flex min-h-screen">
-        <Sidebar />
-        <div className="flex flex-1 flex-col">
-          <Header userEmail={user.email} />
-          <main className="flex-1 px-4 py-6 md:px-8">{children}</main>
-        </div>
-      </div>
+      <div className="min-h-dvh bg-white pb-24">{children}</div>
+      <AppNavigation userEmail={user.email} />
     </OrganizationProvider>
   );
 }

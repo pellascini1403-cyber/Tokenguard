@@ -3,6 +3,7 @@
 import { useActionState } from "react";
 import { resetPasswordAction } from "@/lib/auth/actions";
 import { initialAuthActionState } from "@/lib/auth/auth-action-state";
+import { AppScreen } from "@/components/dashboard/app-screen";
 import { FormError } from "@/components/ui/form-error";
 import { SubmitButton } from "@/components/ui/submit-button";
 
@@ -16,9 +17,8 @@ export default function SecuritySettingsPage() {
   const [state, formAction] = useActionState(resetPasswordAction, initialAuthActionState);
 
   return (
-    <div className="max-w-sm space-y-6">
-      <h1 className="text-xl font-semibold text-zinc-900">Security</h1>
-      <form action={formAction} className="space-y-4">
+    <AppScreen header={<h1 className="text-xl font-semibold">Security</h1>}>
+      <form action={formAction} className="max-w-sm space-y-4">
         <FormError message={state.error} />
         <div className="space-y-1">
           <label htmlFor="password" className="text-sm font-medium text-zinc-700">
@@ -36,6 +36,6 @@ export default function SecuritySettingsPage() {
         </div>
         <SubmitButton pendingLabel="Updating…">Update password</SubmitButton>
       </form>
-    </div>
+    </AppScreen>
   );
 }

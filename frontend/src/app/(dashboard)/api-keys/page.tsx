@@ -1,6 +1,7 @@
 import { requireServerSession } from "@/lib/auth/session";
 import { listOrganizations } from "@/lib/api/organizations";
 import { resolveActiveOrganization } from "@/lib/organizations/resolve-active-organization";
+import { AppScreen } from "@/components/dashboard/app-screen";
 import { MissingBackendCapability } from "@/components/ui/missing-backend-capability";
 import { EmptyState } from "@/components/ui/empty-state";
 import { CreateKeyForm } from "./create-key-form";
@@ -22,17 +23,19 @@ export default async function ApiKeysPage() {
 
   if (!activeOrganization) {
     return (
-      <EmptyState
-        title="No organization selected"
-        description="Create an organization first to manage its API keys."
-      />
+      <AppScreen header={<h1 className="text-xl font-semibold">API Keys</h1>}>
+        <EmptyState
+          title="No organization selected"
+          description="Create an organization first to manage its API keys."
+        />
+      </AppScreen>
     );
   }
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-zinc-900">API Keys — {activeOrganization.name}</h1>
-
+    <AppScreen
+      header={<h1 className="text-xl font-semibold">API Keys — {activeOrganization.name}</h1>}
+    >
       <MissingBackendCapability
         title="No key-listing endpoint exists yet"
         explanation="The backend can create and revoke TokenGuard keys, but has no GET route to list an organization's existing keys. Because of this, a newly created key's plaintext secret and id are only ever shown once, right after creation, and revoking a key requires already knowing its id."
@@ -47,6 +50,6 @@ export default async function ApiKeysPage() {
         <h2 className="text-sm font-medium text-zinc-900">Revoke a key by id</h2>
         <RevokeKeyForm organizationId={activeOrganization.id} />
       </section>
-    </div>
+    </AppScreen>
   );
 }

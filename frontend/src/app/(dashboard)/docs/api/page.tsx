@@ -1,3 +1,5 @@
+import { AppScreen } from "@/components/dashboard/app-screen";
+
 /**
  * Mirrors exactly what backend/README.md documents under "AI proxy" and
  * "Endpoints" — no endpoint is listed here that the backend doesn't
@@ -46,11 +48,10 @@ const ENDPOINTS = [
 
 export default function ApiDocsPage() {
   return (
-    <div className="space-y-4">
-      <h1 className="text-xl font-semibold text-zinc-900">API reference</h1>
-      <div className="overflow-x-auto rounded-lg border border-zinc-200">
+    <AppScreen header={<h1 className="text-xl font-semibold">API reference</h1>}>
+      <div className="overflow-x-auto rounded-lg bg-black">
         <table className="w-full text-left text-sm">
-          <thead className="bg-zinc-50 text-zinc-500">
+          <thead className="text-zinc-500">
             <tr>
               <th className="px-4 py-2 font-medium">Method</th>
               <th className="px-4 py-2 font-medium">Path</th>
@@ -58,18 +59,18 @@ export default function ApiDocsPage() {
               <th className="px-4 py-2 font-medium">Description</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-zinc-200">
+          <tbody className="divide-y divide-zinc-800">
             {ENDPOINTS.map((endpoint) => (
               <tr key={`${endpoint.method}-${endpoint.path}`}>
-                <td className="px-4 py-2 font-mono text-xs">{endpoint.method}</td>
-                <td className="px-4 py-2 font-mono text-xs">{endpoint.path}</td>
-                <td className="px-4 py-2 text-zinc-600">{endpoint.auth}</td>
-                <td className="px-4 py-2 text-zinc-600">{endpoint.description}</td>
+                <td className="px-4 py-2 font-mono text-xs text-white">{endpoint.method}</td>
+                <td className="px-4 py-2 font-mono text-xs text-white">{endpoint.path}</td>
+                <td className="px-4 py-2 text-zinc-400">{endpoint.auth}</td>
+                <td className="px-4 py-2 text-zinc-400">{endpoint.description}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
-    </div>
+    </AppScreen>
   );
 }

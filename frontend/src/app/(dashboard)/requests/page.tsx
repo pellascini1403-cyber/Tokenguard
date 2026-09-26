@@ -1,3 +1,4 @@
+import { AppScreen } from "@/components/dashboard/app-screen";
 import { MissingBackendCapability } from "@/components/ui/missing-backend-capability";
 
 /**
@@ -11,12 +12,11 @@ import { MissingBackendCapability } from "@/components/ui/missing-backend-capabi
  */
 export default function RequestsPage() {
   return (
-    <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-zinc-900">Requests</h1>
+    <AppScreen header={<h1 className="text-xl font-semibold">Requests</h1>}>
       <MissingBackendCapability
         title="No request-log-read endpoint exists yet"
         explanation="The backend stores per-request metadata in token_logs (model, tokens, cost, status, timestamp — never prompts or responses) but has not exposed a route to list or fetch it. This page will list real request metadata once that endpoint exists."
       />
-    </div>
+    </AppScreen>
   );
 }

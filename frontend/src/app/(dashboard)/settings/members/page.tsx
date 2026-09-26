@@ -1,3 +1,4 @@
+import { AppScreen } from "@/components/dashboard/app-screen";
 import { MissingBackendCapability } from "@/components/ui/missing-backend-capability";
 
 /**
@@ -7,12 +8,11 @@ import { MissingBackendCapability } from "@/components/ui/missing-backend-capabi
  */
 export default function MembersPage() {
   return (
-    <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-zinc-900">Members</h1>
+    <AppScreen header={<h1 className="text-xl font-semibold">Members</h1>}>
       <MissingBackendCapability
         title="No member-management endpoint exists yet"
         explanation="Organization membership and roles exist in the database and are enforced server-side (OrganizationsService.requireRole), but there is no route to list members, invite someone, or change a role."
       />
-    </div>
+    </AppScreen>
   );
 }

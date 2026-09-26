@@ -1,3 +1,4 @@
+import { AppScreen } from "@/components/dashboard/app-screen";
 import { MissingBackendCapability } from "@/components/ui/missing-backend-capability";
 
 /**
@@ -10,12 +11,11 @@ import { MissingBackendCapability } from "@/components/ui/missing-backend-capabi
  */
 export default function UsagePage() {
   return (
-    <div className="space-y-6">
-      <h1 className="text-xl font-semibold text-zinc-900">Usage</h1>
+    <AppScreen header={<h1 className="text-xl font-semibold">Usage</h1>}>
       <MissingBackendCapability
         title="No usage-read endpoint exists yet"
         explanation="The backend computes per-organization usage logs and summaries internally (UsageService), but has not exposed them over HTTP. Once a route such as GET /v1/organizations/:organizationId/usage exists, this page will list real usage data here."
       />
-    </div>
+    </AppScreen>
   );
 }

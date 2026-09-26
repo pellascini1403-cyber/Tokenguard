@@ -1,9 +1,12 @@
 # TokenGuard Frontend
 
-The dashboard for TokenGuard, a B2B AI-API-proxy product. This is the
-**architectural foundation** built in Step 10 of the project — routing,
-auth, data-fetching, and API-client scaffolding. It intentionally does
-**not** include final visual design; see "Not built yet" below.
+The dashboard for TokenGuard, a B2B AI-API-proxy product. The
+**architectural foundation** (routing, auth, data-fetching, API-client
+scaffolding) was built in Step 10. A first real visual pass — the bottom
+tab bar and the Overview screen's card layout — was added afterward,
+built from PNG assets supplied by the product's designer (see "Visual
+assets" below); most other screens are still plain structural
+placeholders. See "Not built yet" below for what's still missing.
 
 No frontend existed before this step — this is a fresh Next.js
 application, created as a sibling directory to `backend/` (no root
@@ -55,7 +58,7 @@ frontend/
       onboarding/            Not in either group — reachable right after sign-up, before a shell makes sense
     components/
       ui/                    Generic, backend-agnostic UI primitives (empty state, error message, etc.)
-      dashboard/             The app shell: sidebar, header, mobile nav, nav link list
+      dashboard/             The app shell: bottom tab bar + More panel, AppScreen (black/white zones), asset cards
     lib/
       env.ts                 Typed, fail-fast environment variable access
       supabase/               Browser client, server client, proxy session-refresh logic
@@ -66,7 +69,44 @@ frontend/
     types/                   Domain types mirroring only what the backend actually returns
   proxy.ts (at src/, next to app/) Session refresh + route protection — see "Auth architecture"
   tests/                     Vitest + React Testing Library tests
+  public/assets/
+    nav/                     5 PNGs, one per bottom-nav tab state (home/keys/usage/requests/more-active)
+    overview/                5 PNGs — the card shapes used on /overview (2x2 grid + 1 large)
 ```
+
+## Visual assets
+
+The bottom tab bar and the `/overview` card grid are built from PNG
+assets supplied by the product's designer, not recreated in CSS/SVG. The
+originals (each a full pill image with one tab shown active, or a sheet
+of white rounded-rectangle card shapes) were losslessly cropped to their
+content bounding box with Pillow — a mechanical trim of transparent
+margins, not a redraw — and saved under `public/assets/`. No pixel drawn
+by the designer was altered, recolored, or regenerated.
+
+- **`components/dashboard/app-navigation.tsx`** renders the correct
+  `public/assets/nav/*.png` for the current route (via
+  `app-navigation-config.ts`'s `resolveActiveTab()`) and lays 5 equal
+  invisible tap targets over it — real `<Link>`/`<button>` elements, so
+  navigation is functional, while the pixels stay exactly as provided.
+  The 5th tab ("More", a "+" icon) never navigates; it opens a bottom
+  sheet listing Budgets, Alerts, Settings, Documentation, and Members,
+  plus Logout.
+- **`components/dashboard/asset-card.tsx`** renders one
+  `public/assets/overview/*.png` as a card's background (`next/image`
+  with `fill` + `object-contain`, so the shape is never stretched) with
+  real, live React content centered on top — token counts, costs, org
+  names, etc. stay HTML, never baked into an image.
+- **The black/white split**: each screen has a black header zone and a
+  white body zone (`components/dashboard/app-screen.tsx`). Per the
+  design spec, anything placed in the white zone that reads as a
+  card/panel — `MissingBackendCapability`, `EmptyState`, the
+  organizations list — uses a black background there, never a light
+  card floating on white.
+
+If you're asked to touch this area again: use the asset files as given,
+crop losslessly if you need to isolate a sub-region, and never
+regenerate/redesign the graphics themselves.
 
 ## Routes
 
@@ -75,7 +115,7 @@ frontend/
 | `/` | Redirects to `/overview` or `/login` depending on session. Not a marketing page (out of scope). |
 | `/login`, `/register`, `/forgot-password`, `/reset-password` | Real Supabase Auth forms. |
 | `/onboarding` | Real create-organization form, shown only when the user has zero organizations. See the "onboarding-completion" limitation below. |
-| `/overview` | Real user + organizations data. Documents the missing consolidated-overview endpoint (see below) rather than showing fake metrics. |
+| `/overview` | Real user + organizations data, laid out on the designer's provided card assets. Documents the missing consolidated-overview endpoint (see below) rather than showing fake metrics. |
 | `/usage`, `/requests`, `/requests/[requestId]`, `/budgets` (partially), `/alerts` | Structural placeholders — no backend endpoint exists yet for any of these (see "Missing backend capabilities"). |
 | `/api-keys` | Real create/revoke flow against the backend's actual endpoints. No list endpoint exists, so only a just-created key can ever be shown. |
 | `/settings`, `/settings/members`, `/settings/preferences` | Read-only where data exists (org name/budget), placeholders elsewhere. |
@@ -186,7 +226,7 @@ Server Components fetch directly (no React Query/SWR — not justified at
 this scope: there is no client-side cache invalidation problem yet, since
 nothing here polls or subscribes to live data). `"use client"` is used
 only where interactivity requires it: forms using `useActionState`, the
-organization switcher, the mobile nav toggle. Every dashboard route has a
+organization switcher, the bottom tab bar/More panel. Every dashboard route has a
 `loading.tsx` (the `(dashboard)` route group's, plus one for
 `/requests` and `/requests/[requestId]` specifically) and the
 `(dashboard)` group has one shared `error.tsx`.
@@ -215,9 +255,12 @@ organization switcher, the mobile nav toggle. Every dashboard route has a
 - Active nav state is marked with `aria-current="page"`, not conveyed by
   color alone.
 - Error and status messages use `role="alert"` / `role="status"`.
-- The dashboard shell collapses to a toggled mobile nav below the `md`
-  breakpoint (`components/dashboard/mobile-nav.tsx`) — structural only,
-  not a final mobile design.
+- Every provided PNG used decoratively is marked `alt=""
+  aria-hidden="true"` — the real label lives on the tap target
+  (`aria-label` on the nav `<Link>`/`<button>`) or in the overlaid text,
+  never only inside the image.
+- The More panel is a `role="dialog"` `aria-modal="true"` sheet, closable
+  via its backdrop.
 
 ## Missing backend capabilities
 
@@ -239,15 +282,16 @@ and the relevant service modules directly:
 | User preferences | No concept in the backend | `/settings/preferences` |
 | CORS configuration | No `@fastify/cors` or equivalent; no CORS headers set | Any future client-side (browser) fetch directly to the backend |
 
-## Not built yet (explicitly out of scope for this step)
+## Not built yet (explicitly out of scope so far)
 
-Final visual design, a real chart library, animations/transitions, a
-marketing/landing page, billing/Stripe integration, Slack/webhook
-integrations, advanced alerting or analytics UI, dark-mode, a final
-mobile navigation design, and any custom illustration/image assets.
-Everything above is deliberately left as plain, minimal structure so a
-future visual design pass can restyle components without needing to
-rewrite routing, auth, data-fetching, or domain logic — see the file
+Final visual design for every screen except the bottom nav and
+`/overview`'s card grid (the other dashboard pages are still plain
+structural placeholders — see the Routes table), a real chart library,
+animations/transitions, a marketing/landing page, billing/Stripe
+integration, Slack/webhook integrations, advanced alerting or analytics
+UI, and dark-mode. Everything not yet restyled is deliberately left as
+plain, minimal structure so a future visual pass can restyle it without
+rewriting routing, auth, data-fetching, or domain logic — see the file
 structure's separation of `components/ui`/`components/dashboard` (visual)
 from `lib/`/`types/` (logic/state/data).
 
